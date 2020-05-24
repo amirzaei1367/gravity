@@ -1,4 +1,4 @@
-## imported module
+ ## imported module
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,7 +7,9 @@ import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
+import os
 from sklearn.externals import joblib
+import torchvision.models as models
 # import joblib
 
 from sklearn.decomposition import PCA
@@ -21,17 +23,17 @@ import time
 import logging
 import os
 import json
+import copy
 
 import numpy as np
 import matplotlib.pylab as plt
-
 
 from model import *
 from settings import *
 from helpers import *
 
-import foolbox as foolbox
-from foolbox import *
+from advertorch.attacks import FGSM
+from advertorch.utils import predict_from_logits
 
 random.seed(SEED)
 np.random.seed(SEED)
@@ -39,28 +41,29 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed(SEED)
 torch.backends.cudnn.deterministic = True
 
+
 ### setting up the log
 def set_logger():
-    if not os.path.exists(log_path+"{}".format(chose_dataset)):
-        os.mkdir(log_path+"{}".format(chose_dataset))
+    if not os.path.exists(log_path + "{}".format(chose_dataset)):
+        os.mkdir(log_path + "{}".format(chose_dataset))
 
-    if not os.path.exists(log_path+"{}/{}".format(chose_dataset, chose_model)):
-        os.mkdir(log_path+"{}/{}".format(chose_dataset, chose_model))
+    if not os.path.exists(log_path + "{}/{}".format(chose_dataset, chose_model)):
+        os.mkdir(log_path + "{}/{}".format(chose_dataset, chose_model))
 
-    if not os.path.exists(log_path+"{}/{}/{}".format(chose_dataset, chose_model, model_layer)):
-        os.mkdir(log_path+"{}/{}/{}".format(chose_dataset, chose_model, model_layer))
+    if not os.path.exists(log_path + "{}/{}/{}".format(chose_dataset, chose_model, model_layer)):
+        os.mkdir(log_path + "{}/{}/{}".format(chose_dataset, chose_model, model_layer))
 
-    logging.basicConfig(filename=log_path+"{}/{}/{}/log.log".format(chose_dataset, chose_model, model_layer),
-                                format='%(asctime)s %(message)s',
-                                filemode='w')
-    logger=logging.getLogger()
+    logging.basicConfig(filename=log_path + "{}/{}/{}/log.log".format(chose_dataset, chose_model, model_layer),
+                        format='%(asctime)s: %(funcName)s(): %(lineno)d:\t %(message)s',
+                        filemode='w')
+    logger = logging.getLogger(__name__)
     logger.setLevel(logging.DEBUG)
-    return  logger
-
+    return logger
+logger = set_logger()
 ## setting up the dataloaders
 def cifar10_loader(logger, batch_size=1):
-    normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5],
-                                     std=[0.5, 0.5, 0.5])
+    normalize = transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
+                                     std=[0.2023, 0.1994, 0.2010])
 
     train_transformer = transforms.Compose([
         transforms.ToTensor(),
@@ -71,44 +74,47 @@ def cifar10_loader(logger, batch_size=1):
         transforms.ToTensor(),
         normalize])
 
-    trainset = torchvision.datasets.ImageFolder(os.path.join(dataset_path, 'train'), transform=train_transformer)
-    devset = torchvision.datasets.ImageFolder(os.path.join(dataset_path, 'val'), transform=dev_transformer)
+    ## transformer for the attack
+    adv_transformer = transforms.Compose([
+        transforms.ToTensor()])
 
+    train_data = torchvision.datasets.ImageFolder(os.path.join(dataset_path, 'train'), transform=train_transformer)
+    test_data = torchvision.datasets.ImageFolder(os.path.join(dataset_path, 'val'), transform=dev_transformer)
+    adv_data = torchvision.datasets.ImageFolder(os.path.join(dataset_path, 'val'), transform=dev_transformer)
 
+    train_iterator = torch.utils.data.DataLoader(train_data,
+                                                 batch_size=batch_size,
+                                                 shuffle=True,
+                                                 num_workers=8,
+                                                 pin_memory=True)
 
-    train_iterator = torch.utils.data.DataLoader(trainset,
-                                              batch_size=batch_size,
-                                              shuffle=True,
-                                              num_workers=8,
-                                              pin_memory=True)
+    test_iterator = torch.utils.data.DataLoader(test_data,
+                                                batch_size=batch_size,
+                                                shuffle=False,
+                                                num_workers=8,
+                                                pin_memory=True,
+                                                drop_last=True)
 
-    test_iterator = torch.utils.data.DataLoader(devset,
-                                            batch_size=batch_size,
-                                            shuffle=False,
-                                            num_workers=8,
-                                            pin_memory=True,
-                                            drop_last=True)
+    adv_iterator = torch.utils.data.DataLoader(adv_data,
+                                                batch_size=batch_size,
+                                                shuffle=False,
+                                                num_workers=8,
+                                                pin_memory=True,
+                                                drop_last=True)
 
-
-    return  train_iterator, test_iterator
+    return train_iterator, test_iterator, adv_iterator, len(train_data), len(test_data)
 
 def mnist_loaders(logger, batch_size=1):
-    train_data = datasets.MNIST(root = dataset_path,
-                                train = True,
-                                download = False)
-
-    mean = train_data.data.float().mean() / 255
-    std = train_data.data.float().std() / 255
-
-    logger.info(f'Calculated mean: {mean}')
-    logger.info(f'Calculated std: {std}')
-
     data_transforms = transforms.Compose([
         transforms.Resize(32),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[mean],
-                             std=[std])
+        transforms.Normalize(mean=[0.1307],
+                             std=[0.3081])
     ])
+
+    adv_transforms = transforms.Compose([
+        transforms.Resize(32),
+        transforms.ToTensor()])
 
     train_data = datasets.MNIST(dataset_path,
                                 train=True,
@@ -116,20 +122,102 @@ def mnist_loaders(logger, batch_size=1):
                                 transform=data_transforms)
 
     train_iterator = torch.utils.data.DataLoader(train_data,
-                                                  shuffle=True,
-                                                  batch_size=batch_size)
+                                                 shuffle=True,
+                                                 batch_size=batch_size)
 
     test_data = datasets.MNIST(dataset_path,
                                train=False,
                                download=False,
                                transform=data_transforms)
 
-    test_iterator = torch.utils.data.DataLoader(test_data, batch_size=batch_size)
+    test_iterator = torch.utils.data.DataLoader(test_data, shuffle=False, batch_size=batch_size)
 
-    return  train_iterator, test_iterator
+    adv_data = datasets.MNIST(dataset_path,
+                               train=False,
+                               download=False,
+                               transform=adv_transforms)
+
+    adv_iterator = torch.utils.data.DataLoader(adv_data, shuffle=False, batch_size=batch_size)
+
+    return train_iterator, test_iterator, adv_iterator, len(train_data), len(test_data)
+
+def svhn_loaders(logger, batch_size=1):
+    data_transforms = transforms.Compose([
+        transforms.Resize(32),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.4378, 0.4439, 0.4729],
+                             std=[0.1980, 0.2011, 0.1971])
+    ])
+
+    adv_transforms = transforms.Compose([
+        transforms.Resize(32),
+        transforms.ToTensor()])
+
+    train_data = datasets.SVHN(dataset_path,
+                                train=True,
+                                download=False,
+                                transform=data_transforms)
+
+    train_iterator = torch.utils.data.DataLoader(train_data,
+                                                 shuffle=True,
+                                                 batch_size=batch_size)
+
+    test_data = datasets.SVHN(dataset_path,
+                               train=False,
+                               download=False,
+                               transform=data_transforms)
+
+    test_iterator = torch.utils.data.DataLoader(test_data, shuffle=False, batch_size=batch_size)
+
+    adv_data = datasets.SVHN(dataset_path,
+                               train=False,
+                               download=False,
+                               transform=adv_transforms)
+
+    adv_iterator = torch.utils.data.DataLoader(adv_data, shuffle=False, batch_size=batch_size)
+
+    return train_iterator, test_iterator, adv_iterator, len(train_data), len(test_data)
+
+def fmnist_loaders(logger, batch_size=1):
+    data_transforms = transforms.Compose([
+        transforms.Resize(32),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.1307],
+                             std=[0.3081])
+    ])
+
+    adv_transforms = transforms.Compose([
+        transforms.Resize(32),
+        transforms.ToTensor()])
+
+    train_data = datasets.FashionMNIST(dataset_path,
+                                train=True,
+                                download=False,
+                                transform=data_transforms)
+
+    train_iterator = torch.utils.data.DataLoader(train_data,
+                                                 shuffle=True,
+                                                 batch_size=batch_size)
+
+    test_data = datasets.FashionMNIST(dataset_path,
+                               train=False,
+                               download=False,
+                               transform=data_transforms)
+
+    test_iterator = torch.utils.data.DataLoader(test_data, shuffle=False, batch_size=batch_size)
+
+    adv_data = datasets.FashionMNIST(dataset_path,
+                               train=False,
+                               download=False,
+                               transform=adv_transforms)
+
+    adv_iterator = torch.utils.data.DataLoader(adv_data, shuffle=False, batch_size=batch_size)
+
+    return train_iterator, test_iterator, adv_iterator, len(train_data), len(test_data)
 
 ## training loops
-def train_loop(model, logger, device, optimizer, criterion, train_iterator, test_iterator):
+def train_loop(model, logger, device, optimizer, criterion, train_iterator,
+               test_iterator, chk_fname = 'original_best', score_fname = "original_score", black_box=False):
     # model = LeNet(OUTPUT_DIM, INPUT_DIM)
     logger.info(f'The model has {count_parameters(model):,} trainable parameters')
 
@@ -138,7 +226,7 @@ def train_loop(model, logger, device, optimizer, criterion, train_iterator, test
     # # model = model.to(device)
     # criterion = criterion.to(device)
 
-    best_test_loss = float('inf')
+
     best_test_acc = 0.0
 
     for epoch in range(EPOCHS):
@@ -146,22 +234,24 @@ def train_loop(model, logger, device, optimizer, criterion, train_iterator, test
 
         start_time = time.time()
 
-        train_loss, train_acc = train(model, train_iterator, optimizer, criterion, device)
-        test_loss, test_acc = evaluate(model, test_iterator, criterion, device)
+        train_loss, train_acc = train(model, train_iterator, optimizer, criterion, device, black_box=black_box)
+        test_loss, test_acc = evaluate(model, test_iterator, criterion, device, black_box=black_box)
 
         if test_acc >= best_test_acc:
             best_test_acc = test_acc
             logger.info("new best at epoch {} with acc {}".format(epoch, test_acc))
             logger.info("new best at epoch {} with acc {}".format(epoch, test_loss))
-            torch.save(model.state_dict(), log_path + "{}/{}/{}/original_best.pth".
-                       format(chose_dataset, chose_model, model_layer))
+            torch.save({'state_dict': model.state_dict()}, log_path + "{}/{}/{}/{}.pt".
+                       format(chose_dataset, chose_model, model_layer, chk_fname))
 
-            var = {'epoch':epoch,
-                    'test_acc': test_acc,
-                    'test_loss': test_loss,
+            var = {'epoch': epoch,
+                   'test_acc': test_acc,
+                   'test_loss': test_loss,
                    'train_acc': train_acc,
                    'train_loss': train_loss}
-            with open(log_path + "{}/{}/{}/original_score.json".format(chose_dataset, chose_model, model_layer), "w") as p:
+
+            with open(log_path + "{}/{}/{}/{}.json".format(chose_dataset, chose_model, model_layer, score_fname ),
+                      "w") as p:
                 json.dump(var, p)
 
         end_time = time.time()
@@ -174,33 +264,87 @@ def train_loop(model, logger, device, optimizer, criterion, train_iterator, test
 
     return var
 
-def train_kd_loop(model, logger, device, optimizer, criterion, train_iterator, test_iterator, alfa= 0.1):
+def train_kd_loop(model, logger, device, optimizer, criterion,
+                  train_iterator, test_iterator, index, alfa=0.1,
+                  coef=2, epochs=CENT_SWITCH, epsilon=0.3):
     # model = LeNet(OUTPUT_DIM)
     logger.info(f'The model has {count_parameters(model):,} trainable parameters')
 
-    best_test_loss = float('inf')
-    for epoch in range(EPOCHS):
+    metrics = {}
+    history_gravity_loss = []
+    history_loss_ce = []
+    history_loss_mse_1 = []
+    history_loss_mse_i = []
+    history_acc = []
+    best_test_acc = 0.0
+    for epoch in range(epochs):
+        if (epoch == (epochs-1)):
+            extract_centroid(model=model,
+                             loader=train_iterator,
+                             device=device,
+                             snapshot_name=f'gravity_best_{alfa}_{index}',
+                             ls_name=f'ls_gravity_{alfa}_{index}',
+                             centroid_name=f'gravity_centroids_{alfa}_{index}',
+                             ls_1_name=f'ls_1_gravity_{alfa}_{index}',
+                             centroid_1_name=f'gravity_1_centroids_{alfa}_{index}')
+
+            modified_centroid(centroid_path=f'gravity_centroids_{alfa}_{index}',
+                              ls_path=f'ls_gravity_{alfa}_{index}',
+                              itr=1,
+                              coef=coef,
+                              track_fname='centroid_tracks.csv',
+                              mdfy_cnt_fname='modified_centroids',
+                              epoch=index,
+                              alfa=alfa,
+                              epsilon=epsilon)
+
+            modified_centroid(centroid_path=f'gravity_1_centroids_{alfa}_{index}',
+                              ls_path=f'ls_1_gravity_{alfa}_{index}',
+                              itr=1,
+                              coef=coef,
+                              track_fname='centroid_1_tracks.csv',
+                              mdfy_cnt_fname='modified_1_centroids',
+                              epoch=index,
+                              alfa=alfa,
+                              epsilon=epsilon)
 
         start_time = time.time()
 
-        train_loss, train_acc = train_kd(model, train_iterator, optimizer,
-                                         criterion, device, centroid='modified_centroids',
-                                         alfa=alfa)
-        test_loss, test_acc = evaluate(model, test_iterator, criterion, device)
+        train_loss, train_acc, loss_ce, loss_mse_1, loss_mse_i = train_kd(model=model,
+                                                                 iterator=train_iterator,
+                                                                 optimizer=optimizer,
+                                                                 criterion=criterion,
+                                                                 device=device,
+                                                                 centroid='modified_centroids',
+                                                                 centroid_1='modified_1_centroids',
+                                                                 alfa=alfa)
 
-        if test_loss < best_test_loss:
-            best_test_loss = test_loss
+        test_loss, test_acc = evaluate(model=model,
+                                       iterator=test_iterator,
+                                       criterion=criterion,
+                                       device=device)
+
+        history_gravity_loss.append(train_loss)
+        history_loss_ce.append(loss_ce)
+        history_loss_mse_1.append(loss_mse_1)
+        history_loss_mse_i.append(loss_mse_i)
+        history_acc.append(train_acc)
+        if test_acc >= best_test_acc:
+            best_test_acc = test_acc
             logger.info("new best at epoch {} with acc {}".format(epoch, test_acc))
             logger.info("new best at epoch {} with acc {}".format(epoch, test_acc))
-            torch.save(model.state_dict(), log_path + "{}/{}/{}/gravity_best_{}.pth".
-                       format(chose_dataset, chose_model, model_layer, alfa))
+            torch.save({'state_dict': model.state_dict()},
+                       log_path + "{}/{}/{}/gravity_best_{}_{}.pt".format(chose_dataset,
+                                                                       chose_model, model_layer, alfa, index))
 
-            var = {'epoch':epoch,
-                    'test_acc': test_acc,
-                    'test_loss': test_loss,
+            var = {'epoch': epoch,
+                   'test_acc': test_acc,
+                   'test_loss': test_loss,
                    'train_acc': train_acc,
                    'train_loss': train_loss}
-            with open(log_path + "{}/{}/{}/gravity_score.json".format(chose_dataset, chose_model, model_layer), "w") as p:
+            with open(log_path + "{}/{}/{}/gravity_score.json".format(chose_dataset,
+                                                                      chose_model,
+                                                                      model_layer),"w") as p:
                 json.dump(var, p)
 
         end_time = time.time()
@@ -210,15 +354,58 @@ def train_kd_loop(model, logger, device, optimizer, criterion, train_iterator, t
         logger.info(f'Epoch: {epoch + 1:02} | Epoch Time: {epoch_mins}m {epoch_secs}s')
         logger.info(f'\tTrain Loss: {train_loss:.3f} | Train Acc: {train_acc * 100:.2f}%')
         logger.info(f'\t Val. Loss: {test_loss:.3f} |  Val. Acc: {test_acc * 100:.2f}%')
+
+
+    if not os.path.exists(log_path + "{}/{}/{}/metrics.json".
+            format(chose_dataset, chose_model, model_layer)):
+
+        metrics['gravity_loss'] = history_gravity_loss
+        metrics['loss_ce'] = history_loss_ce
+        metrics['loss_mse_1'] = history_loss_mse_1
+        metrics['loss_mse_i'] = history_loss_mse_i
+        metrics['train_acc'] = history_acc
+        with open(log_path + "{}/{}/{}/metrics.json".
+                format(chose_dataset, chose_model, model_layer), "w") as p:
+            json.dump(metrics, p, indent=4)
+    else:
+        with open(log_path + "{}/{}/{}/metrics.json".
+                format(chose_dataset, chose_model, model_layer), 'r+') as p:
+            metrics=json.load(p)
+            metrics['gravity_loss']+=(history_gravity_loss)
+            metrics['loss_ce'] += history_loss_ce
+            metrics['loss_mse_1'] += history_loss_mse_1
+            metrics['loss_mse_i'] += history_loss_mse_i
+            metrics['train_acc'] += history_acc
+            # p.seek(0)
+            json.dump(metrics, open(log_path + "{}/{}/{}/metrics.json".
+                format(chose_dataset, chose_model, model_layer), 'w'), indent=4)
+            # p.truncate()
+
+        # os.remove(log_path + "{}/{}/{}/metrics.json".
+        #         format(chose_dataset, chose_model, model_layer))
+        # with open(log_path + "{}/{}/{}/metrics.json".
+        #         format(chose_dataset, chose_model, model_layer), "w") as p:
+        #     json.dump(metrics, p, indent=4)
+
 
     return var
 
 def main_trainer():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if chose_dataset == 'cifar10':
-        model = Net(OUTPUT_DIM, INPUT_DIM, model_layer)
+        # model = Net(OUTPUT_DIM, INPUT_DIM, model_layer)
+        model = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+    if chose_dataset == 'cifar100':
+        # model = Net(OUTPUT_DIM, INPUT_DIM, model_layer)
+        model = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+    if chose_dataset == 'svhn':
+        # model = Net(OUTPUT_DIM, INPUT_DIM, model_layer)
+        model = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
     if chose_dataset == 'mnist':
         model = LeNet(OUTPUT_DIM, INPUT_DIM, model_layer)
+    if chose_dataset == 'fmnist':
+        model = LeNet(OUTPUT_DIM, INPUT_DIM, model_layer)
+
 
     model = model.to(device)
 
@@ -226,79 +413,146 @@ def main_trainer():
     criterion = nn.CrossEntropyLoss()
     criterion = criterion.to(device)
 
-    logger=set_logger()
-
-    if not os.path.exists(log_path + "{}/{}/{}/original_best.pth".format(chose_dataset, chose_model, model_layer)):
-        if chose_dataset == 'cifar10':
-            train_iterator, test_iterator = cifar10_loader(logger, batch_size=64)
-        if chose_dataset == 'mnist':
-            train_iterator, test_iterator = mnist_loaders(logger, batch_size=64)
-
-        metric_before_gravity = train_loop(model, logger, device, optimizer, criterion, train_iterator, test_iterator)
-    else:
-        metric_before_gravity = joblib.load(log_path + "{}/{}/{}/original_score.json".format(chose_dataset, chose_model, model_layer))
+    # logger = set_logger()
 
     if chose_dataset == 'cifar10':
-        train_iterator, test_iterator = cifar10_loader(logger, batch_size=1)
+        train_iterator, test_iterator,_,_,_ = cifar10_loader(logger, batch_size=cifar_batch)
+    if chose_dataset == 'cifar100':
+        train_iterator, test_iterator,_,_,_ = cifar100_loader(logger, batch_size=cifar_batch)
+    if chose_dataset == 'svhn':
+        train_iterator, test_iterator, _, _, _ = svhn_loader(logger, batch_size=svhn_batch)
     if chose_dataset == 'mnist':
-        train_iterator, test_iterator = mnist_loaders(logger, batch_size=1)
+        train_iterator, test_iterator,_,_,_ = mnist_loaders(logger, batch_size=mnist_batch)
+    if chose_dataset == 'fmnist':
+        train_iterator, test_iterator, _, _, _ = fmnist_loaders(logger, batch_size=fmnist_batch)
 
 
-    ls_original, _ = extract_centroid(model=model, loader=train_iterator,
-                        device=device, snapshot_name='original_best',
-                        ls_name='ls_original', centroid_name='original_centroids')
-    vis(ls_name=f'ls_original', component=2, technique='tsne')
+    if not os.path.exists(log_path + "{}/{}/{}/original_best.pt".format(chose_dataset, chose_model, model_layer)):
+        logger.info("training the original model")
+        metric_before_gravity = train_loop(model=model,
+                                           logger=logger,
+                                           device=device,
+                                           optimizer=optimizer,
+                                           criterion=criterion,
+                                           train_iterator=train_iterator,
+                                           test_iterator=test_iterator,
+                                           chk_fname = 'original_best',
+                                           score_fname = "original_score",
+                                           black_box = False)
+    else:
+        logger.info("model is already trained")
+        with open(log_path + "{}/{}/{}/original_score.json".format(chose_dataset, chose_model, model_layer)) as p:
+            metric_before_gravity = json.load(p)
 
-        # dist_before_gravity = distance_metric(ls_original)
+    logger.info("extracting the original model latent spaces ...")
+    ls_original, _, _ = extract_centroid(model=model,
+                                         loader=train_iterator,
+                                         device=device,
+                                         snapshot_name='original_best',
+                                         ls_name='ls_original',
+                                         centroid_name='original_centroids',
+                                         ls_1_name='ls_1_original',
+                                         centroid_1_name='original_1_centroids')
+
+    logger.info("visualizing the original latent spaces ...")
+    vis(ls_name=f'ls_original',
+        component=2,
+        technique='tsne')
+
+    vis(ls_name=f'ls_1_original',
+        component=2,
+        technique='tsne')
+
+    logger.info("extracing the distance metrics of the original latent spaces ...")
+    # dist_before_gravity = distance_metric(ls_original)
     min_before_gravity, dist_before_gravity = distancetree_metric('original_centroids')
-        # logger.info('distance before gravity {}'.format(dist_before_gravity))
-    modified_centroid(centroid_path='original_centroids', ls_path='ls_original', itr=4 , coef=1.5)
+    min_1_before_gravity, dist_1_before_gravity = distancetree_metric('original_1_centroids')
+    # logger.info('distance before gravity {}'.format(dist_before_gravity))
 
+    logger.info("creating the modifed centroid and centroid track of the original model...")
+    modified_centroid(centroid_path='original_centroids',
+                      ls_path='ls_original',
+                      itr=1,
+                      coef=1,
+                      track_fname='centroid_tracks.csv',
+                      mdfy_cnt_fname='modified_centroids',
+                      epoch=-1,
+                      alfa=1.0,
+                      epsilon=0.3)
+
+    modified_centroid(centroid_path='original_1_centroids',
+                      ls_path='ls_1_original',
+                      itr=1,
+                      coef=1,
+                      track_fname='centroid_1_tracks.csv',
+                      mdfy_cnt_fname='modified_1_centroids',
+                      epoch=-1,
+                      alfa=1.0,
+                      epsilon=0.3)
+
+    logger.info("start to train the student model...")
     distances = []
     # for alfa in np.linspace(0, 5, 11):
-    for alfa in [1.0, 5.0, 10.0, 20.0, 30.0, 40.0, 50.0]:
-    # for alfa in [1]:
+    # for alfa in [1.0, 5.0, 10.0, 20.0, 30.0, 40.0, 50.0]:
+    alfa = metric_before_gravity['test_acc']
+    for index in range(CENT_SWITCH):
+        logger.info(f"{index}'th-round of centroid chanted...")
+        alfa = round(alfa, 5)
+        epsilon = 0.3 ## this could be adaptive
         temp = {}
-
-        if chose_dataset == 'cifar10':
-            train_iterator, test_iterator = cifar10_loader(logger, batch_size=64)
-        if chose_dataset == 'mnist':
-            train_iterator, test_iterator = mnist_loaders(logger, batch_size=64)
-
-        metric_after_gravity = train_kd_loop(model, logger, device, optimizer,
-                                             criterion, train_iterator, test_iterator, alfa=alfa)
-
-        if chose_dataset == 'cifar10':
-            train_iterator, test_iterator = cifar10_loader(logger, batch_size=1)
-        if chose_dataset == 'mnist':
-            train_iterator, test_iterator = mnist_loaders(logger, batch_size=1)
-
-        ls_gravity, _ = extract_centroid(model=model, loader=train_iterator,
-                         device=device, snapshot_name=f'gravity_best_{alfa}',
-                         ls_name=f'ls_gravity_{alfa}', centroid_name=f'gravity_centroids_{alfa}')
-
-        vis(ls_name=f'ls_gravity_{alfa}', component=2, technique='tsne')
+        # model, logger, device, optimizer, criterion, train_iterator, test_iterator, alfa = 0.1, coef = 2
+        logger.info(f"start train_kd_loop at {index}/{CENT_SWITCH}'th-round of centroid chanted...")
+        metric_after_gravity = train_kd_loop(model=model,
+                                             logger=logger,
+                                             device=device,
+                                             optimizer=optimizer,
+                                             criterion=criterion,
+                                             train_iterator=train_iterator,
+                                             test_iterator=test_iterator,
+                                             index=index,
+                                             alfa=alfa,
+                                             coef=200,
+                                             epochs=EPOCHS,
+                                             epsilon=epsilon)
+        logger.info(f"extracting centroids at {index}/{CENT_SWITCH}'th-round of centroid changed...")
+        ls_gravity, _, _ = extract_centroid(model=model,
+                                            loader=train_iterator,
+                                            device=device,
+                                            snapshot_name=f'gravity_best_{alfa}_{index}',
+                                            ls_name=f'ls_gravity_{alfa}_{index}',
+                                            centroid_name=f'gravity_centroids_{alfa}_{index}',
+                                            ls_1_name=f'ls_1_gravity_{alfa}_{index}',
+                                            centroid_1_name=f'gravity_1_centroids_{alfa}_{index}')
+        logger.info(f"visulizing latent spaces of student at {index}/{CENT_SWITCH}'th-round of centroid changed...")
+        vis(ls_name=f'ls_gravity_{alfa}_{index}', component=2, technique='tsne')
+        vis(ls_name=f'ls_1_gravity_{alfa}_{index}', component=2, technique='tsne')
 
         # temp['alfa'] = alfa
         # temp['dist'] = distance_metric(ls_gravity)
 
-
+        temp['index'] = index
         temp['alfa'] = alfa
-        temp['min'], temp['dist'] = distancetree_metric(f'gravity_centroids_{alfa}')
+        temp['min'], temp['dist'] = distancetree_metric(f'gravity_centroids_{alfa}_{index}')
+        temp['min_1'], temp['dist_1'] = distancetree_metric(f'gravity_1_centroids_{alfa}_{index}')
         temp['epoch'] = metric_after_gravity['epoch']
         temp['test_acc'] = metric_after_gravity['test_acc']
         temp['test_loss'] = metric_after_gravity['test_loss']
         temp['train_acc'] = metric_after_gravity['train_acc']
         temp['train_loss'] = metric_after_gravity['train_loss']
 
-
         distances.append(temp.copy())
+
+        alfa = metric_after_gravity['test_acc']
         # logger.info('distance after gravity  dist {}'.format(distance_metric(ls_gravity)))
 
+    
     temp = {}
+    temp['index'] = -1
     temp['alfa'] = np.nan
     temp['dist'] = dist_before_gravity
-    temp['min']  = min_before_gravity
+    temp['min'] = min_before_gravity
+    temp['dist_1'] = dist_1_before_gravity
+    temp['min_1'] = min_1_before_gravity
 
     temp['epoch'] = metric_before_gravity['epoch']
     temp['test_acc'] = metric_before_gravity['test_acc']
@@ -306,283 +560,1928 @@ def main_trainer():
     temp['train_acc'] = metric_before_gravity['train_acc']
     temp['train_loss'] = metric_before_gravity['train_loss']
 
+    logger.info(f"creating the distances.csv")
     distances.append(temp.copy())
-
+                                       
     df = pd.DataFrame(distances)
     df.to_csv(log_path + "{}/{}/{}/distances.csv".
+              format(chose_dataset, chose_model, model_layer))
+
+def best_alfa(name):
+    df1 = pd.read_csv(log_path + "{}/{}/{}/{}".
+                       format(chose_dataset, chose_model, model_layer, name))
+    df1.dropna(inplace=True)
+    all_test_acc = df1['test_loss'] / np.max(df1['test_loss'])
+    all_min_1 = df1['min_1'] / np.max(df1['min_1'])
+    all_min_i = df1['min'] / np.max(df1['min'])
+    altogether = all_test_acc * all_test_acc * all_min_1 * all_min_i
+    selected_alfa = df1.loc[np.argmax(altogether)]['alfa']
+    selected_alfa = round(selected_alfa, 5)
+    selected_index = df1.loc[np.argmax(altogether)]['index']
+    logger.info('best_alfa_{}_{}'.format(selected_alfa, int(selected_index)))
+    return '{}_{}'.format(selected_alfa, int(selected_index))
+
+###fgsm
+os.environ['TORCH_HOME'] = log_path + "{}/{}/{}/".format(chose_dataset, chose_model, model_layer)
+def bb_attack_fgsm(alfa):
+    global logger
+    logger.info(f"start bb_attack_fgsm at {alfa}")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # device = torch.device('cpu')
+    # logger = set_logger()
+    if chose_dataset == 'cifar10':
+        mean = [0.4914, 0.4822, 0.4465]
+        std = [0.2023, 0.1994, 0.2010]
+        M_O = models.vgg19(pretrained=True)
+        num_ftrs = M_O.classifier[6].in_features
+        M_O.classifier[6].in_features = nn.Linear(num_ftrs, OUTPUT_DIM)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        # M_O = Net(OUTPUT_DIM, INPUT_DIM)
+        # M_G = Net(OUTPUT_DIM, INPUT_DIM)
+        #nos is number of samples
+        train_iterator, test_iterator, adv_iterator, nos_train, nos_test = cifar10_loader(logger, batch_size=cifar_batch)
+    if chose_dataset == 'mnist':
+        mean = [0.1307]
+        std = [0.3081]
+        M_O = models.vgg19(pretrained=True)
+        M_O.features[0] = nn.Conv2d(1, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        num_ftrs = M_O.classifier[6].in_features
+        M_O.classifier[6].in_features = nn.Linear(num_ftrs, OUTPUT_DIM)
+        M_G = LeNet(OUTPUT_DIM, INPUT_DIM)
+        train_iterator, test_iterator, adv_iterator, nos_train, nos_test = mnist_loaders(logger, batch_size=mnist_batch)
+
+    optimizer = optim.Adam(M_O.parameters(), lr=1e-4)
+    criterion = nn.CrossEntropyLoss()
+    criterion = criterion.to(device)
+    M_O = M_O.to(device)
+    M_G = M_G.to(device)
+
+
+    if not os.path.exists(log_path + "{}/{}/{}/bb_VGG19_best.pt".format(chose_dataset, chose_model, model_layer)):
+        logger.info("training the black box VGG19")
+        train_loop(model=M_O,
+                   logger=logger,
+                   device=device,
+                   optimizer=optimizer,
+                   criterion=criterion,
+                   train_iterator=train_iterator,
+                   test_iterator=test_iterator,
+                   chk_fname = 'bb_VGG19_best',
+                   score_fname = "bb_VGG19_score",
+                   black_box = True)
+    else:
+        logger.info("the black box VGG19 is already trained")
+        chkp1 = torch.load(log_path + "{}/{}/{}/bb_VGG19_best.pt".
+                           format(chose_dataset, chose_model, model_layer), map_location=device)
+        M_O.load_state_dict(chkp1['state_dict'])
+
+
+    chkp2 = torch.load(log_path + "{}/{}/{}/gravity_best_{}.pt".
+                                   format(chose_dataset, chose_model, model_layer, alfa), map_location=device)
+    M_G.load_state_dict(chkp2['state_dict'])
+
+    M_O.eval()
+    M_G.eval()
+
+    acc_eps = { 0.05:{}, 0.1:{}, 0.3: {}, 0.7: {}, 1:{}}
+
+
+    foolrates = defaultdict(list)
+    for eps, _ in acc_eps.items():
+        M_O_adv_acc = 0
+        M_O_clean_acc = 0
+        M_G_adv_acc = 0
+        M_G_clean_acc = 0
+        ###attack on the teacher model
+        for i, (data_batch, labels_batch) in enumerate(adv_iterator):
+            data_batch = data_batch.to(device)
+            labels_batch = labels_batch.to(device)
+            ##attack on original model
+            # preds = (M_O(data_batch.clone().detach())[0]).argmax(1, keepdim=True)
+            # correct = preds.eq(labels_batch.view_as(preds)).sum()
+            # acc_tmp = correct.float() / preds.shape[0]
+            # M_O_clean_acc += acc_tmp.item()
+            M_O_clean_acc += torch.sum(
+                        M_O(normalize(data_batch.clone().detach(), mean, std, chose_dataset)).argmax(dim=-1) == labels_batch).item()
+
+            adv = attack(model=M_O,
+                         criterion=criterion,
+                         img=data_batch,
+                         label=labels_batch,
+                         eps=eps,
+                         attack_type='fgsm',
+                         iters=10,
+                         mean=mean,
+                         std=std,
+                         dataset=chose_dataset,
+                         black_box=True)
+            M_O_adv_acc += torch.sum(M_O(normalize(adv.clone().detach(),
+                                        mean, std, chose_dataset)).argmax(dim=-1) == labels_batch).item()
+
+            ##attack on robusted model
+            M_G_clean_acc += torch.sum(
+                        M_G(normalize(data_batch.clone().detach(),
+                                      mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+            M_G_adv_acc += torch.sum(
+                        M_G(normalize(adv.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+            logger.info(f'bb FGSM epsilon {eps} Batch: {i}')
+
+
+        foolrates[eps] = {'MO_clean_acc': M_O_clean_acc/nos_test,
+                          'MO_adv_acc': M_O_adv_acc/nos_test,
+                          'MG_clean_acc': M_G_clean_acc/nos_test,
+                          'MG_adv_acc': M_G_adv_acc/nos_test}.copy()
+
+
+    with open(log_path + "{}/{}/{}/bb_FGSM_attack.json".format(chose_dataset, chose_model, model_layer),
+              "w") as p:
+        json.dump(foolrates, p)
+
+    logger.info(f"finish bb_attack_fgsm at {alfa}")
+def wb_attack_fgsm(alfa):
+    global logger
+    logger.info(f"start wb_attack_fgsm at {alfa}")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # device = torch.device('cpu')
+    logger = set_logger()
+    if chose_dataset == 'cifar10':
+        mean = [0.4914, 0.4822, 0.4465]
+        std = [0.2023, 0.1994, 0.2010]
+        M_O = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        # M_O = Net(OUTPUT_DIM, INPUT_DIM)
+        # M_G = Net(OUTPUT_DIM, INPUT_DIM)
+        #nos is number of samples
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = cifar10_loader(logger, batch_size=cifar_batch)
+    if chose_dataset == 'mnist':
+        mean = [0.1307]
+        std = [0.3081]
+        M_O = LeNet(OUTPUT_DIM, INPUT_DIM)
+        M_G = LeNet(OUTPUT_DIM, INPUT_DIM)
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = mnist_loaders(logger, batch_size=mnist_batch)
+
+    chkp1 = torch.load(log_path + "{}/{}/{}/original_best.pt".
+                                   format(chose_dataset, chose_model, model_layer), map_location=device)
+    M_O.load_state_dict(chkp1['state_dict'])
+
+    chkp2 = torch.load(log_path + "{}/{}/{}/gravity_best_{}.pt".
+                                   format(chose_dataset, chose_model, model_layer, alfa), map_location=device)
+    M_G.load_state_dict(chkp2['state_dict'])
+
+    M_O = M_O.to(device)
+    M_G = M_G.to(device)
+    M_O.eval()
+    M_G.eval()
+
+    optimizer = optim.Adam(M_O.parameters(), lr=1e-4)
+    criterion = nn.CrossEntropyLoss()
+    criterion = criterion.to(device)
+    acc_eps = { 0.05:{}, 0.1:{}, 0.3: {}, 0.7: {}, 1:{}}
+
+
+    foolrates = defaultdict(list)
+    for eps, _ in acc_eps.items():
+        M_O_adv_acc = 0
+        M_O_clean_acc = 0
+        M_G_adv_acc = 0
+        M_G_clean_acc = 0
+        ###attack on the teacher model
+        for i, (data_batch, labels_batch) in enumerate(adv_iterator):
+            data_batch = data_batch.to(device)
+            labels_batch = labels_batch.to(device)
+            ##attack on original model
+            # preds = (M_O(data_batch.clone().detach())[0]).argmax(1, keepdim=True)
+            # correct = preds.eq(labels_batch.view_as(preds)).sum()
+            # acc_tmp = correct.float() / preds.shape[0]
+            # M_O_clean_acc += acc_tmp.item()
+            M_O_clean_acc += torch.sum(
+                        M_O(normalize(data_batch.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+            adv = attack(model=M_O,
+                         criterion=criterion,
+                         img=data_batch,
+                         label=labels_batch,
+                         eps=eps,
+                         attack_type='fgsm',
+                         iters=10,
+                         mean=mean,
+                         std=std,
+                         dataset=chose_dataset,
+                         black_box=False)
+            M_O_adv_acc += torch.sum(M_O(normalize(adv.clone().detach(),
+                                        mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+            ##attack on robusted model
+            M_G_clean_acc += torch.sum(
+                        M_G(normalize(data_batch.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+            adv = attack(model=M_G,
+                         criterion=criterion,
+                         img=data_batch,
+                         label=labels_batch,
+                         eps=eps,
+                         attack_type='fgsm',
+                         iters=10,
+                         mean=mean,
+                         std=std,
+                         dataset=chose_dataset,
+                         black_box=False)
+            M_G_adv_acc += torch.sum(M_G(normalize(adv.clone().detach(),
+                                        mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+            logger.info(f'FGSM epsilon {eps} Batch: {i}')
+
+
+        foolrates[eps] = {'MO_clean_acc': M_O_clean_acc/nos_test,
+                          'MO_adv_acc': M_O_adv_acc/nos_test,
+                          'MG_clean_acc': M_G_clean_acc/nos_test,
+                          'MG_adv_acc': M_G_adv_acc/nos_test}.copy()
+
+
+    with open(log_path + "{}/{}/{}/wb_FGSM_attack.json".format(chose_dataset, chose_model, model_layer),
+              "w") as p:
+        json.dump(foolrates, p)
+
+    logger.info(f"finish wb_attack_fgsm at {alfa}")
+###pgd
+def bb_attack_pgd(alfa):
+    global logger
+    logger.info(f"start bb_attack_pgd at {alfa}")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # device = torch.device('cpu')
+    # logger = set_logger()
+    if chose_dataset == 'cifar10':
+        mean = [0.4914, 0.4822, 0.4465]
+        std = [0.2023, 0.1994, 0.2010]
+        M_O = models.vgg19(pretrained=True)
+        num_ftrs = M_O.classifier[6].in_features
+        M_O.classifier[6].in_features = nn.Linear(num_ftrs, OUTPUT_DIM)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        # M_O = Net(OUTPUT_DIM, INPUT_DIM)
+        # M_G = Net(OUTPUT_DIM, INPUT_DIM)
+        #nos is number of samples
+        train_iterator, test_iterator, adv_iterator, nos_train, nos_test = cifar10_loader(logger, batch_size=cifar_batch)
+    if chose_dataset == 'mnist':
+        mean = [0.1307]
+        std = [0.3081]
+        M_O = models.vgg19(pretrained=True)
+        M_O.features[0] = nn.Conv2d(1, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        num_ftrs = M_O.classifier[6].in_features
+        M_O.classifier[6].in_features = nn.Linear(num_ftrs, OUTPUT_DIM)
+        M_G = LeNet(OUTPUT_DIM, INPUT_DIM)
+        train_iterator, test_iterator, adv_iterator, nos_train, nos_test = mnist_loaders(logger, batch_size=mnist_batch)
+
+    optimizer = optim.Adam(M_O.parameters(), lr=1e-4)
+    criterion = nn.CrossEntropyLoss()
+    criterion = criterion.to(device)
+    M_O = M_O.to(device)
+    M_G = M_G.to(device)
+
+
+    if not os.path.exists(log_path + "{}/{}/{}/bb_VGG19_best.pt".format(chose_dataset, chose_model, model_layer)):
+        logger.info("training the black box VGG19")
+        train_loop(model=M_O,
+                   logger=logger,
+                   device=device,
+                   optimizer=optimizer,
+                   criterion=criterion,
+                   train_iterator=train_iterator,
+                   test_iterator=test_iterator,
+                   chk_fname = 'bb_VGG19_best',
+                   score_fname = "bb_VGG19_score",
+                   black_box = True)
+    else:
+        logger.info("the black box VGG19 is already trained")
+        chkp1 = torch.load(log_path + "{}/{}/{}/bb_VGG19_best.pt".
+                           format(chose_dataset, chose_model, model_layer), map_location=device)
+        M_O.load_state_dict(chkp1['state_dict'])
+
+
+    chkp2 = torch.load(log_path + "{}/{}/{}/gravity_best_{}.pt".
+                                   format(chose_dataset, chose_model, model_layer, alfa), map_location=device)
+    M_G.load_state_dict(chkp2['state_dict'])
+
+
+    M_O.eval()
+    M_G.eval()
+
+
+    acc_itrs = { 10: {}, 100:{}}
+
+
+    foolrates = defaultdict(list)
+    for acc_itr, _ in acc_itrs.items():
+        M_O_adv_acc = 0
+        M_O_clean_acc = 0
+        M_G_adv_acc = 0
+        M_G_clean_acc = 0
+        ###attack on the teacher model
+        for i, (data_batch, labels_batch) in enumerate(test_iterator):
+            data_batch = data_batch.to(device)
+            labels_batch = labels_batch.to(device)
+            ##attack on original model
+            M_O_clean_acc += torch.sum(
+                        M_O(normalize(data_batch.clone().detach(), mean, std, chose_dataset)).argmax(dim=-1) == labels_batch).item()
+            adv = attack(model=M_O,
+                         criterion=criterion,
+                         img=data_batch,
+                         label=labels_batch,
+                         eps=0.3,
+                         attack_type='pgd',
+                         iters=acc_itr,
+                         mean=mean,
+                         std=std,
+                         dataset=chose_dataset,
+                         black_box=True)
+            M_O_adv_acc += torch.sum(M_O(normalize(adv.clone().detach(),
+                                        mean, std, chose_dataset)).argmax(dim=-1) == labels_batch).item()
+            ##attack on robusted model
+            M_G_clean_acc += torch.sum(
+                        M_G(normalize(data_batch.clone().detach(),
+                                      mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+            M_G_adv_acc += torch.sum(
+                        M_G(normalize(adv.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+            logger.info(f'bb pgd epsilon {acc_itr} Batch: {i}')
+
+
+        foolrates[acc_itr] = {'MO_clean_acc': M_O_clean_acc/nos_test,
+                          'MO_adv_acc': M_O_adv_acc/nos_test,
+                          'MG_clean_acc': M_G_clean_acc/nos_test,
+                          'MG_adv_acc': M_G_adv_acc/nos_test}.copy()
+
+
+    with open(log_path + "{}/{}/{}/bb_pgd_attack.json".format(chose_dataset, chose_model, model_layer),
+              "w") as p:
+        json.dump(foolrates, p)
+
+    logger.info(f"finish bb_attack_pgd at {alfa}")
+def wb_attack_pgd(alfa):
+    global logger
+    logger.info(f"start wb_attack_pgd at {alfa}")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger = set_logger()
+    if chose_dataset == 'cifar10':
+        mean = [0.4914, 0.4822, 0.4465]
+        std = [0.2023, 0.1994, 0.2010]
+        M_O = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        train_iterator, test_iterator, adv_iterator, nos_train, nos_test = cifar10_loader(logger, batch_size=cifar_batch)
+    if chose_dataset == 'mnist':
+        mean = [0.1307]
+        std = [0.3081]
+        M_O = LeNet(OUTPUT_DIM, INPUT_DIM)
+        M_G = LeNet(OUTPUT_DIM, INPUT_DIM)
+        train_iterator, test_iterator, adv_iterator, nos_train, nos_test = mnist_loaders(logger, batch_size=mnist_batch)
+
+    chkp1 = torch.load(log_path + "{}/{}/{}/original_best.pt".
+                                   format(chose_dataset, chose_model, model_layer))
+    M_O.load_state_dict(chkp1['state_dict'])
+
+    chkp2 = torch.load(log_path + "{}/{}/{}/gravity_best_{}.pt".
+                                   format(chose_dataset, chose_model, model_layer, alfa))
+    M_G.load_state_dict(chkp2['state_dict'])
+
+    M_O = M_O.to(device)
+    M_G = M_G.to(device)
+    M_O.eval()
+    M_G.eval()
+
+    optimizer = optim.Adam(M_O.parameters(), lr=1e-4)
+    criterion = nn.CrossEntropyLoss()
+    criterion = criterion.to(device)
+
+
+    acc_itrs = { 10: {}, 100:{}}
+
+
+    foolrates = defaultdict(list)
+    for acc_itr, _ in acc_itrs.items():
+        M_O_adv_acc = 0
+        M_O_clean_acc = 0
+        M_G_adv_acc = 0
+        M_G_clean_acc = 0
+        ###attack on the teacher model
+        for i, (data_batch, labels_batch) in enumerate(test_iterator):
+            data_batch = data_batch.to(device)
+            labels_batch = labels_batch.to(device)
+            ##attack on original model
+            M_O_clean_acc += torch.sum(
+                M_O(normalize(data_batch.clone().detach(), mean, std, chose_dataset))[0].argmax(
+                    dim=-1) == labels_batch).item()
+            adv = attack(model=M_O,
+                         criterion=criterion,
+                         img=data_batch,
+                         label=labels_batch,
+                         eps=0.3,
+                         attack_type='pgd',
+                         iters=acc_itr,
+                         mean=mean,
+                         std=std,
+                         dataset=chose_dataset,
+                         black_box=False)
+            M_O_adv_acc += torch.sum(M_O(normalize(adv.clone().detach(),
+                                        mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+            ##attack on robusted model
+            M_G_clean_acc += torch.sum(
+                M_G(normalize(data_batch.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+            adv = attack(model=M_G,
+                         criterion=criterion,
+                         img=data_batch,
+                         label=labels_batch,
+                         eps=1,
+                         attack_type='pgd',
+                         iters=acc_itr,
+                         mean=mean,
+                         std=std,
+                         dataset=chose_dataset,
+                         black_box=False)
+
+            M_G_adv_acc += torch.sum(M_G(normalize(adv.clone().detach(),
+                                        mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+            logger.info(f'wb pgd epsilon {acc_itr} Batch: {i}')
+
+
+        foolrates[acc_itr] = {'MO_clean_acc': M_O_clean_acc/nos_test,
+                          'MO_adv_acc': M_O_adv_acc/nos_test,
+                          'MG_clean_acc': M_G_clean_acc/nos_test,
+                          'MG_adv_acc': M_G_adv_acc/nos_test}.copy()
+
+
+    with open(log_path + "{}/{}/{}/wb_pgd_attack.json".format(chose_dataset, chose_model, model_layer),
+              "w") as p:
+        json.dump(foolrates, p)
+
+    logger.info(f"finish wb_attack_pgd at {alfa}")
+###bim
+def bb_attack_bim(alfa):
+    global logger
+    logger.info(f"start bb_attack_bim at {alfa}")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # device = torch.device('cpu')
+    # logger = set_logger()
+    if chose_dataset == 'cifar10':
+        mean = [0.4914, 0.4822, 0.4465]
+        std = [0.2023, 0.1994, 0.2010]
+        M_O = models.vgg19(pretrained=True)
+        num_ftrs = M_O.classifier[6].in_features
+        M_O.classifier[6].in_features = nn.Linear(num_ftrs, OUTPUT_DIM)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        # M_O = Net(OUTPUT_DIM, INPUT_DIM)
+        # M_G = Net(OUTPUT_DIM, INPUT_DIM)
+        #nos is number of samples
+        train_iterator, test_iterator, nos_train, nos_test = cifar10_loader(logger, batch_size=cifar_batch)
+    if chose_dataset == 'mnist':
+        mean = [0.1307]
+        std = [0.3081]
+        M_O = models.vgg19(pretrained=True)
+        M_O.features[0] = nn.Conv2d(1, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        num_ftrs = M_O.classifier[6].in_features
+        M_O.classifier[6].in_features = nn.Linear(num_ftrs, OUTPUT_DIM)
+        M_G = LeNet(OUTPUT_DIM, INPUT_DIM)
+        train_iterator, test_iterator, nos_train, nos_test = mnist_loaders(logger, batch_size=mnist_batch)
+
+    optimizer = optim.Adam(M_O.parameters(), lr=1e-4)
+    criterion = nn.CrossEntropyLoss()
+    criterion = criterion.to(device)
+    M_O = M_O.to(device)
+    M_G = M_G.to(device)
+
+
+    if not os.path.exists(log_path + "{}/{}/{}/bb_VGG19_best.pt".format(chose_dataset, chose_model, model_layer)):
+        logger.info("training the black box VGG19")
+        train_loop(model=M_O,
+                   logger=logger,
+                   device=device,
+                   optimizer=optimizer,
+                   criterion=criterion,
+                   train_iterator=train_iterator,
+                   test_iterator=test_iterator,
+                   chk_fname = 'bb_VGG19_best',
+                   score_fname = "bb_VGG19_score",
+                   black_box = True)
+    else:
+        logger.info("the black box VGG19 is already trained")
+        chkp1 = torch.load(log_path + "{}/{}/{}/bb_VGG19_best.pt".
+                           format(chose_dataset, chose_model, model_layer), map_location=device)
+        M_O.load_state_dict(chkp1['state_dict'])
+
+
+    chkp2 = torch.load(log_path + "{}/{}/{}/gravity_best_{}.pt".
+                                   format(chose_dataset, chose_model, model_layer, alfa), map_location=device)
+    M_G.load_state_dict(chkp2['state_dict'])
+
+
+    M_O.eval()
+    M_G.eval()
+
+
+
+    acc_eps = {0.1:{}, 0.3: {}, 0.7:{}}
+
+
+    foolrates = defaultdict(list)
+    for eps, _ in acc_eps.items():
+        M_O_adv_acc = 0
+        M_O_clean_acc = 0
+        M_G_adv_acc = 0
+        M_G_clean_acc = 0
+        ###attack on the teacher model
+        for i, (data_batch, labels_batch) in enumerate(test_iterator):
+            data_batch = data_batch.to(device)
+            labels_batch = labels_batch.to(device)
+            ##attack on original model
+            M_O_clean_acc += torch.sum(M_O(data_batch.clone().detach()).argmax(dim=-1) == labels_batch).item()
+            adv = attack(model=M_O,
+                         criterion=criterion,
+                         img=data_batch,
+                         label=labels_batch,
+                         eps=eps,
+                         attack_type='bim',
+                         iters=10,
+                         mean=mean,
+                         std=std,
+                         dataset=chose_dataset,
+                         black_box=True)
+            M_O_adv_acc += torch.sum(M_O(normalize(adv.clone().detach(), mean, std, chose_dataset)).argmax(dim=-1) == labels_batch).item()
+
+            ##attack on robusted model
+            M_G_clean_acc += torch.sum(M_G(data_batch.clone().detach())[0].argmax(dim=-1) == labels_batch).item()
+            M_G_adv_acc += torch.sum(M_G(normalize(adv.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+            logger.info(f'bim epsilon {eps} Batch: {i}')
+
+
+        foolrates[eps] = {'MO_clean_acc': M_O_clean_acc/nos_test,
+                          'MO_adv_acc': M_O_adv_acc/nos_test,
+                          'MG_clean_acc': M_G_clean_acc/nos_test,
+                          'MG_adv_acc': M_G_adv_acc/nos_test}.copy()
+
+
+    with open(log_path + "{}/{}/{}/bb_bim_attack.json".format(chose_dataset, chose_model, model_layer),
+              "w") as p:
+        json.dump(foolrates, p)
+
+    logger.info(f"finish bb_attack_bim at {alfa}")
+def wb_attack_bim(alfa):
+    global logger
+    logger.info(f"start wb_attack_bim at {alfa}")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger = set_logger()
+    if chose_dataset == 'cifar10':
+        mean = [0.4914, 0.4822, 0.4465]
+        std = [0.2023, 0.1994, 0.2010]
+        M_O = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        train_iterator, test_iterator, adv_iterator, nos_train, nos_test = cifar10_loader(logger, batch_size=cifar_batch)
+    if chose_dataset == 'mnist':
+        mean = [0.1307]
+        std = [0.3081]
+        M_O = LeNet(OUTPUT_DIM, INPUT_DIM)
+        M_G = LeNet(OUTPUT_DIM, INPUT_DIM)
+        train_iterator, test_iterator, adv_iterator, nos_train, nos_test = mnist_loaders(logger, batch_size=mnist_batch)
+
+    chkp1 = torch.load(log_path + "{}/{}/{}/original_best.pt".
+                                   format(chose_dataset, chose_model, model_layer))
+    M_O.load_state_dict(chkp1['state_dict'])
+
+    chkp2 = torch.load(log_path + "{}/{}/{}/gravity_best_{}.pt".
+                                   format(chose_dataset, chose_model, model_layer, alfa))
+    M_G.load_state_dict(chkp2['state_dict'])
+
+    M_O = M_O.to(device)
+    M_G = M_G.to(device)
+    M_O.eval()
+    M_G.eval()
+
+    criterion = nn.CrossEntropyLoss()
+    criterion = criterion.to(device)
+
+
+    acc_eps = {0.1:{}, 0.3: {}, 0.7:{}}
+
+
+    foolrates = defaultdict(list)
+    for eps, _ in acc_eps.items():
+        M_O_adv_acc = 0
+        M_O_clean_acc = 0
+        M_G_adv_acc = 0
+        M_G_clean_acc = 0
+        ###attack on the teacher model
+        for i, (data_batch, labels_batch) in enumerate(test_iterator):
+            data_batch = data_batch.to(device)
+            labels_batch = labels_batch.to(device)
+            ##attack on original model
+            M_O_clean_acc += torch.sum(M_O(data_batch.clone().detach())[0].argmax(dim=-1) == labels_batch).item()
+            adv = attack(model=M_O,
+                         criterion=criterion,
+                         img=data_batch,
+                         label=labels_batch,
+                         eps=eps,
+                         attack_type='bim',
+                         iters=10,
+                         mean=mean,
+                         std=std,
+                         dataset=chose_dataset,
+                         black_box=False)
+            M_O_adv_acc += torch.sum(M_O(normalize(adv.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+            ##attack on robusted model
+            M_G_clean_acc += torch.sum(M_G(data_batch.clone().detach())[0].argmax(dim=-1) == labels_batch).item()
+            adv = attack(model=M_G,
+                         criterion=criterion,
+                         img=data_batch,
+                         label=labels_batch,
+                         eps=eps,
+                         attack_type='bim',
+                         iters=10,
+                         mean=mean,
+                         std=std,
+                         dataset=chose_dataset,
+                         black_box=False)
+            M_G_adv_acc += torch.sum(M_G(normalize(adv.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+            logger.info(f'wb bim epsilon {eps} Batch: {i}')
+
+
+        foolrates[eps] = {'MO_clean_acc': M_O_clean_acc/nos_test,
+                          'MO_adv_acc': M_O_adv_acc/nos_test,
+                          'MG_clean_acc': M_G_clean_acc/nos_test,
+                          'MG_adv_acc': M_G_adv_acc/nos_test}.copy()
+
+
+    with open(log_path + "{}/{}/{}/wb_bim_attack.json".format(chose_dataset, chose_model, model_layer),
+              "w") as p:
+        json.dump(foolrates, p)
+
+    logger.info(f"finish wb_attack_bim at {alfa}")
+###mim
+def bb_attack_mim(alfa):
+    global logger
+    logger.info(f"start bb_attack_mim at {alfa}")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # device = torch.device('cpu')
+    # logger = set_logger()
+    if chose_dataset == 'cifar10':
+        mean = [0.4914, 0.4822, 0.4465]
+        std = [0.2023, 0.1994, 0.2010]
+        M_O = models.vgg19(pretrained=True)
+        num_ftrs = M_O.classifier[6].in_features
+        M_O.classifier[6].in_features = nn.Linear(num_ftrs, OUTPUT_DIM)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        # M_O = Net(OUTPUT_DIM, INPUT_DIM)
+        # M_G = Net(OUTPUT_DIM, INPUT_DIM)
+        #nos is number of samples
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = cifar10_loader(logger, batch_size=cifar_batch)
+    if chose_dataset == 'mnist':
+        mean = [0.1307]
+        std = [0.3081]
+        M_O = models.vgg19(pretrained=True)
+        M_O.features[0] = nn.Conv2d(1, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        num_ftrs = M_O.classifier[6].in_features
+        M_O.classifier[6].in_features = nn.Linear(num_ftrs, OUTPUT_DIM)
+        M_G = LeNet(OUTPUT_DIM, INPUT_DIM)
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = mnist_loaders(logger, batch_size=mnist_batch)
+
+    optimizer = optim.Adam(M_O.parameters(), lr=1e-4)
+    criterion = nn.CrossEntropyLoss()
+    criterion = criterion.to(device)
+    M_O = M_O.to(device)
+    M_G = M_G.to(device)
+
+
+    if not os.path.exists(log_path + "{}/{}/{}/bb_VGG19_best.pt".format(chose_dataset, chose_model, model_layer)):
+        logger.info("training the black box VGG19")
+        train_loop(model=M_O,
+                   logger=logger,
+                   device=device,
+                   optimizer=optimizer,
+                   criterion=criterion,
+                   train_iterator=train_iterator,
+                   test_iterator=test_iterator,
+                   chk_fname = 'bb_VGG19_best',
+                   score_fname = "bb_VGG19_score",
+                   black_box = True)
+    else:
+        logger.info("the black box VGG19 is already trained")
+        chkp1 = torch.load(log_path + "{}/{}/{}/bb_VGG19_best.pt".
+                           format(chose_dataset, chose_model, model_layer), map_location=device)
+        M_O.load_state_dict(chkp1['state_dict'])
+
+
+    chkp2 = torch.load(log_path + "{}/{}/{}/gravity_best_{}.pt".
+                                   format(chose_dataset, chose_model, model_layer, alfa), map_location=device)
+    M_G.load_state_dict(chkp2['state_dict'])
+
+
+    M_O.eval()
+    M_G.eval()
+
+
+    acc_itrs = { 10: {}, 50: {}, 100:{}}
+
+
+    foolrates = defaultdict(list)
+    for acc_itr, _ in acc_itrs.items():
+        M_O_adv_acc = 0
+        M_O_clean_acc = 0
+        M_G_adv_acc = 0
+        M_G_clean_acc = 0
+        ###attack on the teacher model
+        for i, (data_batch, labels_batch) in enumerate(test_iterator):
+            data_batch = data_batch.to(device)
+            labels_batch = labels_batch.to(device)
+            ##attack on original model
+            M_O_clean_acc += torch.sum(M_O(data_batch.clone().detach()).argmax(dim=-1) == labels_batch).item()
+            adv = attack(model=M_O,
+                         criterion=criterion,
+                         img=data_batch,
+                         label=labels_batch,
+                         eps=0.3,
+                         attack_type='mim',
+                         iters=acc_itr,
+                         mean=mean,
+                         std=std,
+                         dataset=chose_dataset,
+                         black_box=True)
+            M_O_adv_acc += torch.sum(M_O(normalize(adv.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+            ##attack on robusted model
+            M_G_clean_acc += torch.sum(M_G(data_batch.clone().detach()).argmax(dim=-1) == labels_batch).item()
+            M_G_adv_acc += torch.sum(M_G(normalize(adv.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+            logger.info(f'bb mim epsilon {acc_itr} Batch: {i}')
+
+
+        foolrates[acc_itr] = {'MO_clean_acc': M_O_clean_acc/nos_test,
+                              'MO_adv_acc': M_O_adv_acc/nos_test,
+                              'MG_clean_acc': M_G_clean_acc/nos_test,
+                              'MG_adv_acc': M_G_adv_acc/nos_test}.copy()
+
+
+    with open(log_path + "{}/{}/{}/bb_mim_attack.json".format(chose_dataset, chose_model, model_layer),
+              "w") as p:
+        json.dump(foolrates, p)
+
+    logger.info(f"finish bb_attack_mim at {alfa}")
+def wb_attack_mim(alfa):
+    global logger
+    logger.info(f"start wb_attack_mim at {alfa}")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger = set_logger()
+    if chose_dataset == 'cifar10':
+        mean = [0.4914, 0.4822, 0.4465]
+        std = [0.2023, 0.1994, 0.2010]
+        M_O = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = cifar10_loader(logger, batch_size=cifar_batch)
+    if chose_dataset == 'mnist':
+        mean = [0.1307]
+        std = [0.3081]
+        M_O = LeNet(OUTPUT_DIM, INPUT_DIM)
+        M_G = LeNet(OUTPUT_DIM, INPUT_DIM)
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = mnist_loaders(logger, batch_size=mnist_batch)
+
+    chkp1 = torch.load(log_path + "{}/{}/{}/original_best.pt".
                        format(chose_dataset, chose_model, model_layer))
+    M_O.load_state_dict(chkp1['state_dict'])
 
-def wb_original_attacker():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger = set_logger()
-    if chose_dataset == 'cifar10':
-        M_O = Net_fb(OUTPUT_DIM, INPUT_DIM)
-        train_iterator, test_iterator = cifar10_loader(logger, batch_size=64)
-    if chose_dataset == 'mnist':
-        M_O = LeNet_fb(OUTPUT_DIM, INPUT_DIM)
-        train_iterator, test_iterator = mnist_loaders(logger, batch_size=64)
-
-    M_O = M_O.to(device)
-    M_O.eval()
-    criterion = nn.CrossEntropyLoss()
-    criterion = criterion.to(device)
-                                                                                       
-    M_O.load_state_dict(torch.load(log_path + "{}/{}/{}/original_best.pth".
-                                   format(chose_dataset, chose_model, model_layer)))
-    # test_loss, test_acc = evaluate(M_O, test_iterator, criterion, device)
-    # print(f'\t M_O Val. Loss: {test_loss:.3f} |  Val. Acc: {test_acc * 100:.2f}%')
-
-    min_total, max_total = min_max(train_iterator)
-    acc_eps = {0.05:{}, 0.1:{}, 0.2:{}, 0.3:{}}
-
-    if chose_dataset == 'cifar10':
-        train_iterator, test_iterator = cifar10_loader(logger, batch_size=1)
-    if chose_dataset == 'mnist':
-        train_iterator, test_iterator = mnist_loaders(logger, batch_size=1)
-
-    FM_O = foolbox.models.PyTorchModel(M_O, bounds=(min_total, max_total), num_classes=10)
-    attack_M_O = foolbox.attacks.FGSM(FM_O)
-
-    perturbation_norms  = defaultdict(list)
-    foolrates = defaultdict(list)
-    for eps, _ in acc_eps.items():
-        # teacher_adversarial_images = []
-        # student_adversarial_images = []
-        foolrate = 0
-        robust = 0
-        become_adversarial = 0
-        already_adversarial = 0
-
-        ###attack on the teacher model
-        for i, (data_batch, labels_batch) in enumerate(train_iterator):
-
-            img_numpy = data_batch.cpu().numpy()
-            label_numpy = labels_batch.cpu().numpy()
-
-            # print('shape ', img_numpy.shape)
-            adversarial = attack_M_O(img_numpy, label_numpy,
-                                     unpack=False, epsilons=[eps])
-
-            ##Does this mean attack failed for input data?
-            # if adversarial[0].distance.value == 0 or adversarial[0].distance.value == np.inf:
-            if (adversarial[0] is None) or (adversarial[0].distance.value == np.inf):
-                robust += 1
-                continue
-
-            ## these are already adversarial example; with out adding any noise
-            if (adversarial[0] .distance.value == 0):
-                already_adversarial += 1
-                continue
-
-            ## the rest are successful obtained adversarial example
-            perturbation = adversarial[0].unperturbed - adversarial[0].perturbed
-            perturbation_norm = np.linalg.norm(perturbation)
-            perturbation_norms[eps].append(perturbation_norm)
-            become_adversarial += 1
-            # foolrate += 1
-
-
-        foolrates[eps] = {'robust': robust,
-                          'become_adversarial':become_adversarial,
-                          'already_adversarial':already_adversarial}.copy()
-
-    var = {}
-    for eps, item in perturbation_norms.items():
-        var[eps] = {'min': str(min(item)),
-                    'max': str(max(item)),
-                    'robust': str(foolrates[eps]['robust']),
-                    'become_adversarial': str(foolrates[eps]['become_adversarial']),
-                    'already_adversarial': str(foolrates[eps]['already_adversarial']),
-                    'foolrate':str((foolrates[eps]['become_adversarial'] + foolrates[eps]['already_adversarial'])/len(train_iterator.dataset))
-                    }
-
-    with open(log_path + "{}/{}/{}/wb_original_distance.json".format(chose_dataset, chose_model, model_layer), "w") as p:
-        json.dump(var, p)
-
-def wb_gravity_attacker():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger = set_logger()
-    if chose_dataset == 'cifar10':
-        M_G = Net_fb(OUTPUT_DIM, INPUT_DIM)
-        train_iterator, test_iterator = cifar10_loader(logger, batch_size=64)
-    if chose_dataset == 'mnist':
-        M_G = LeNet_fb(OUTPUT_DIM, INPUT_DIM)
-        train_iterator, test_iterator = mnist_loaders(logger, batch_size=64)
-
-    M_G = M_G.to(device)
-    M_G.eval()
-
-    criterion = nn.CrossEntropyLoss()
-    criterion = criterion.to(device)
-
-    ## selecting the best weights that lead to the maximum min_link
-    dff = pd.read_csv(log_path + "{}/{}/{}/distances.csv".format(chose_dataset, chose_model, model_layer))
-    alfa_index = dff.iloc[dff['min'].idxmax()]['alfa']
-    M_G.load_state_dict(torch.load(log_path + "{}/{}/{}/gravity_best_{}.pth".
-                                   format(chose_dataset, chose_model, model_layer, alfa_index)))
-    # test_loss, test_acc = evaluate(M_G, test_iterator, criterion, device)
-    # print(f'\t M_G Val. Loss: {test_loss:.3f} |  Val. Acc: {test_acc * 100:.2f}%')
-
-    min_total, max_total = min_max(train_iterator)
-    acc_eps = {0.05:{}, 0.1:{}, 0.2:{}, 0.3:{}}
-
-    if chose_dataset == 'cifar10':
-        train_iterator, test_iterator = cifar10_loader(logger, batch_size=1)
-    if chose_dataset == 'mnist':
-        train_iterator, test_iterator = mnist_loaders(logger, batch_size=1)
-
-    FM_G = foolbox.models.PyTorchModel(M_G, bounds=(min_total, max_total), num_classes=10)
-    attack_M_G = foolbox.attacks.FGSM(FM_G)
-
-    perturbation_norms = defaultdict(list)
-    foolrates = defaultdict(list)
-    for eps, _ in acc_eps.items():
-        # teacher_adversarial_images = []
-        # student_adversarial_images = []
-        foolrate = 0
-        robust = 0
-        become_adversarial = 0
-        already_adversarial = 0
-        ###attack on the teacher model
-        for i, (data_batch, labels_batch) in enumerate(train_iterator):
-            img_numpy = data_batch.cpu().numpy()
-            label_numpy = labels_batch.cpu().numpy()
-            adversarial = attack_M_G(img_numpy, label_numpy,
-                                     unpack=False, epsilons=[eps])
-
-            ##Does this mean attack failed for input data?
-            # if adversarial[0].distance.value == 0 or adversarial[0].distance.value == np.inf:
-            if (adversarial[0] is None) or (adversarial[0].distance.value == np.inf):
-                robust += 1
-                continue
-
-            if (adversarial[0].distance.value == 0):
-                already_adversarial += 1
-                continue
-
-            perturbation = adversarial[0].unperturbed - adversarial[0].perturbed
-            perturbation_norm = np.linalg.norm(perturbation)
-            perturbation_norms[eps].append(perturbation_norm)
-            become_adversarial += 1
-            # foolrate += 1
-
-        foolrates[eps] = {'robust': robust,
-                          'become_adversarial':become_adversarial,
-                          'already_adversarial':already_adversarial}.copy()
-
-    var = {}
-    for eps, item in perturbation_norms.items():
-        var[eps] = {'min': str(min(item)),
-                    'max': str(max(item)),
-                    'robust': str(foolrates[eps]['robust']),
-                    'become_adversarial': str(foolrates[eps]['become_adversarial']),
-                    'already_adversarial': str(foolrates[eps]['already_adversarial']),
-                    'foolrate':str((foolrates[eps]['become_adversarial'] + foolrates[eps]['already_adversarial'])/len(train_iterator.dataset))
-                    }
-
-    with open(log_path + "{}/{}/{}/wb_gravity_distance.json".format(chose_dataset, chose_model, model_layer), "w") as p:
-        json.dump(var, p)
-
-def bb_attacker():
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger = set_logger()
-    if chose_dataset == 'cifar10':
-        M_O = Net_fb(OUTPUT_DIM, INPUT_DIM)
-        M_G = Net_fb(OUTPUT_DIM, INPUT_DIM)
-        train_iterator, test_iterator = cifar10_loader(logger, batch_size=1)
-    if chose_dataset == 'mnist':
-        M_O = LeNet_fb(OUTPUT_DIM, INPUT_DIM)
-        M_G = LeNet_fb(OUTPUT_DIM, INPUT_DIM)
-        train_iterator, test_iterator = mnist_loaders(logger, batch_size=1)
+    chkp2 = torch.load(log_path + "{}/{}/{}/gravity_best_{}.pt".
+                       format(chose_dataset, chose_model, model_layer, alfa))
+    M_G.load_state_dict(chkp2['state_dict'])
 
     M_O = M_O.to(device)
     M_G = M_G.to(device)
+    M_O.eval()
+    M_G.eval()
+
     criterion = nn.CrossEntropyLoss()
     criterion = criterion.to(device)
 
-    M_O.load_state_dict(torch.load(log_path + "{}/{}/{}/original_best.pth".
-                                   format(chose_dataset, chose_model, model_layer)))
+    acc_itrs = { 10: {}, 50: {}, 100:{}}
 
-    ## selecting the best weights that lead to the maximum min_link
-    dff = pd.read_csv(log_path + "{}/{}/{}/distances.csv".format(chose_dataset, chose_model, model_layer))
-    alfa_index = dff.iloc[dff['min'].idxmax()]['alfa']
-    M_G.load_state_dict(torch.load(log_path + "{}/{}/{}/gravity_best_{}.pth".
-                                   format(chose_dataset, chose_model, model_layer, alfa_index)))
+
+    foolrates = defaultdict(list)
+    for acc_itr, _ in acc_itrs.items():
+        M_O_adv_acc = 0
+        M_O_clean_acc = 0
+        M_G_adv_acc = 0
+        M_G_clean_acc = 0
+        ###attack on the teacher model
+        for i, (data_batch, labels_batch) in enumerate(test_iterator):
+            data_batch = data_batch.to(device)
+            labels_batch = labels_batch.to(device)
+            ##attack on original model
+            M_O_clean_acc += torch.sum(M_O(data_batch.clone().detach())[0].argmax(dim=-1) == labels_batch).item()
+            adv = attack(model=M_O,
+                         criterion=criterion,
+                         img=data_batch,
+                         label=labels_batch,
+                         eps=0.3,
+                         attack_type='mim',
+                         iters=acc_itr,
+                         mean=mean,
+                         std=std,
+                         dataset=chose_dataset,
+                         black_box=False)
+            M_O_adv_acc += torch.sum(M_O(normalize(adv.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+            ##attack on robusted model
+            M_G_clean_acc += torch.sum(M_G(data_batch.clone().detach())[0].argmax(dim=-1) == labels_batch).item()
+            adv = attack(model=M_G,
+                         criterion=criterion,
+                         img=data_batch,
+                         label=labels_batch,
+                         eps=0.3,
+                         attack_type='mim',
+                         iters=acc_itr,
+                         mean=mean,
+                         std=std,
+                         dataset=chose_dataset,
+                         black_box=False)
+            M_G_adv_acc += torch.sum(M_G(normalize(adv.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+            logger.info(f'wb mim epsilon {acc_itr} Batch: {i}')
+
+
+        foolrates[acc_itr] = {'MO_clean_acc': M_O_clean_acc/nos_test,
+                              'MO_adv_acc': M_O_adv_acc/nos_test,
+                              'MG_clean_acc': M_G_clean_acc/nos_test,
+                              'MG_adv_acc': M_G_adv_acc/nos_test}.copy()
+
+
+    with open(log_path + "{}/{}/{}/wb_mim_attack.json".format(chose_dataset, chose_model, model_layer),
+              "w") as p:
+        json.dump(foolrates, p)
+
+    logger.info(f"finish wb_attack_mim at {alfa}")
+###CW
+def wb_attack_cw(alfa):
+    global logger
+    logger.info(f"start wb_attack_cw at {alfa}")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger = set_logger()
+    if chose_dataset == 'cifar10':
+        mean = [0.4914, 0.4822, 0.4465]
+        std = [0.2023, 0.1994, 0.2010]
+        M_O = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = cifar10_loader(logger, batch_size=cifar_batch)
+    if chose_dataset == 'mnist':
+        mean = [0.1307]
+        std = [0.3081]
+        M_O = LeNet(OUTPUT_DIM, INPUT_DIM)
+        M_G = LeNet(OUTPUT_DIM, INPUT_DIM)
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = mnist_loaders(logger, batch_size=mnist_batch)
+
+    chkp1 = torch.load(log_path + "{}/{}/{}/original_best.pt".
+                       format(chose_dataset, chose_model, model_layer))
+    M_O.load_state_dict(chkp1['state_dict'])
+
+    chkp2 = torch.load(log_path + "{}/{}/{}/gravity_best_{}.pt".
+                       format(chose_dataset, chose_model, model_layer, alfa))
+    M_G.load_state_dict(chkp2['state_dict'])
+
+    M_O = M_O.to(device)
+    M_G = M_G.to(device)
+    M_O.eval()
+    M_G.eval()
+
+    criterion = nn.CrossEntropyLoss()
+    criterion = criterion.to(device)
+
+    acc_itrs = {1000: {}}
+
+
+    foolrates = defaultdict(list)
+    for acc_itr, _ in acc_itrs.items():
+        M_O_adv_acc = 0
+        M_O_clean_acc = 0
+        M_G_adv_acc = 0
+        M_G_clean_acc = 0
+        ###attack on the teacher model
+        for i, (data_batch, labels_batch) in enumerate(test_iterator):
+            data_batch = data_batch.to(device)
+            labels_batch = labels_batch.to(device)
+            ##attack on original model
+            M_O_clean_acc += torch.sum(M_O(data_batch.clone().detach())[0].argmax(dim=-1) == labels_batch).item()
+            adv = attack(model=M_O,
+                         criterion=criterion,
+                         img=data_batch,
+                         label=labels_batch,
+                         eps=1,
+                         attack_type='cw',
+                         iters=acc_itr,
+                         mean=mean,
+                         std=std,
+                         dataset=chose_dataset)
+            M_O_adv_acc += torch.sum(M_O(normalize(adv.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+            ##attack on robusted model
+            M_G_clean_acc += torch.sum(M_G(data_batch.clone().detach())[0].argmax(dim=-1) == labels_batch).item()
+            adv = attack(model=M_G,
+                         criterion=criterion,
+                         img=data_batch,
+                         label=labels_batch,
+                         eps=1,
+                         attack_type='cw',
+                         iters=acc_itr,
+                         mean=mean,
+                         std=std,
+                         dataset=chose_dataset)
+            M_G_adv_acc += torch.sum(M_G(normalize(adv.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+            print(f'cw epsilon {acc_itr} Batch: {i}')
+
+
+        foolrates[acc_itr] = {'MO_clean_acc': M_O_clean_acc/nos_test,
+                              'MO_adv_acc': M_O_adv_acc/nos_test,
+                              'MG_clean_acc': M_G_clean_acc/nos_test,
+                              'MG_adv_acc': M_G_adv_acc/nos_test}.copy()
+
+
+    with open(log_path + "{}/{}/{}/cw_attack.json".format(chose_dataset, chose_model, model_layer),
+              "w") as p:
+        json.dump(foolrates, p)
+
+    logger.info(f"finish wb_attack_cw at {alfa}")
+
+###white box attack
+def wb_attacks(alfa):
+    global logger
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # device = torch.device('cpu')
+    logger = set_logger()
+    if chose_dataset == 'cifar10':
+        mean = [0.4914, 0.4822, 0.4465]
+        std = [0.2023, 0.1994, 0.2010]
+        M_O = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        # M_O = Net(OUTPUT_DIM, INPUT_DIM)
+        # M_G = Net(OUTPUT_DIM, INPUT_DIM)
+        #nos is number of samples
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = cifar10_loader(logger, batch_size=cifar_batch)
+    if chose_dataset == 'cifar100':
+        mean = [0.507, 0.487, 0.441]
+        std = [0.267, 0.256, 0.276]
+        M_O = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        # M_O = Net(OUTPUT_DIM, INPUT_DIM)
+        # M_G = Net(OUTPUT_DIM, INPUT_DIM)
+        #nos is number of samples
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = cifar100_loader(logger, batch_size=cifar_batch)
+    if chose_dataset == 'svhn':
+        mean=[0.4378, 0.4439, 0.4729]
+        std=[0.1980, 0.2011, 0.1971]
+        M_O = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        # M_O = Net(OUTPUT_DIM, INPUT_DIM)
+        # M_G = Net(OUTPUT_DIM, INPUT_DIM)
+        #nos is number of samples
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = svhn_loader(logger, batch_size=svhn_batch)
+    if chose_dataset == 'mnist':
+        mean = [0.1307]
+        std = [0.3081]
+        M_O = LeNet(OUTPUT_DIM, INPUT_DIM)
+        M_G = LeNet(OUTPUT_DIM, INPUT_DIM)
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = mnist_loaders(logger, batch_size=mnist_batch)
+    if chose_dataset == 'fmnist':
+        mean = [0.1307]
+        std = [0.3081]
+        M_O = LeNet(OUTPUT_DIM, INPUT_DIM)
+        M_G = LeNet(OUTPUT_DIM, INPUT_DIM)
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = fmnist_loaders(logger, batch_size=fmnist_batch)
+
+    chkp1 = torch.load(log_path + "{}/{}/{}/original_best.pt".
+                                   format(chose_dataset, chose_model, model_layer), map_location=device)
+    M_O.load_state_dict(chkp1['state_dict'])
+
+    chkp2 = torch.load(log_path + "{}/{}/{}/gravity_best_{}.pt".
+                                   format(chose_dataset, chose_model, model_layer, alfa), map_location=device)
+    M_G.load_state_dict(chkp2['state_dict'])
+
+    M_O = M_O.to(device)
+    M_G = M_G.to(device)
+    M_O.eval()
+    M_G.eval()
+
+    optimizer = optim.Adam(M_O.parameters(), lr=1e-4)
+    criterion = nn.CrossEntropyLoss()
+    criterion = criterion.to(device)
+
+    for atk_name in ['fgsm', 'pgd', 'bim', 'mim']:
+        logger.info(f"start wb_attack_{atk_name} at {alfa}")
+        if atk_name == 'fgsm':
+            # acc_eps = {0.05: {}, 0.1: {}, 0.3: {}, 0.7: {}, 1: {}}
+            acc_eps = [0.05, 0.1, 0.3, 0.7, 1]
+            acc_itrs = [1]*len(acc_eps)
+
+        if atk_name == 'pgd':
+            # acc_itrs = {10: {}, 100: {}}
+            acc_itrs = [10, 100 , 200]
+            acc_eps = [0.3]*len(acc_itrs)
+
+        if atk_name == 'bim':
+            # acc_eps = {0.1: {}, 0.3: {}, 0.7: {}}
+            acc_eps = [0.1, 0.3, 0.7, 1]
+            acc_itrs = [10] * len(acc_eps)
+
+        if atk_name == 'mim':
+            # acc_itrs = {10: {}, 50: {}, 100: {}}
+            acc_itrs = [10, 50, 100, 200]
+            acc_eps = [0.3]*len(acc_itrs)
+
+        foolrates = defaultdict(list)
+        for acc_itr, eps in zip(acc_itrs, acc_eps):
+            M_O_adv_acc = 0
+            M_O_clean_acc = 0
+            M_G_adv_acc = 0
+            M_G_clean_acc = 0
+            ###attack on the teacher model
+            for i, (data_batch, labels_batch) in enumerate(adv_iterator):
+                data_batch = data_batch.to(device)
+                labels_batch = labels_batch.to(device)
+                ##attack on original model
+                M_O_clean_acc += torch.sum(
+                    M_O(normalize(data_batch.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+                adv = attack(model=M_O,
+                             criterion=criterion,
+                             img=data_batch,
+                             label=labels_batch,
+                             eps=eps,
+                             attack_type=atk_name,
+                             iters=acc_itr,
+                             mean=mean,
+                             std=std,
+                             dataset=chose_dataset,
+                             black_box=False)
+                M_O_adv_acc += torch.sum(
+                    M_O(normalize(adv.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+                ##attack on robusted model
+                M_G_clean_acc += torch.sum(
+                    M_G(normalize(data_batch.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+                adv = attack(model=M_G,
+                             criterion=criterion,
+                             img=data_batch,
+                             label=labels_batch,
+                             eps=eps,
+                             attack_type=atk_name,
+                             iters=acc_itr,
+                             mean=mean,
+                             std=std,
+                             dataset=chose_dataset,
+                             black_box=False)
+                M_G_adv_acc += torch.sum(
+                    M_G(normalize(adv.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+                logger.info(f'wb {atk_name} epsilon {eps} itr {acc_itr} Batch: {i}')
+
+            foolrates[acc_itr] = {'MO_clean_acc': M_O_clean_acc / nos_test,
+                                  'MO_adv_acc': M_O_adv_acc / nos_test,
+                                  'MG_clean_acc': M_G_clean_acc / nos_test,
+                                  'MG_adv_acc': M_G_adv_acc / nos_test}.copy()
+
+            foolrates[eps] = {'MO_clean_acc': M_O_clean_acc / nos_test,
+                              'MO_adv_acc': M_O_adv_acc / nos_test,
+                              'MG_clean_acc': M_G_clean_acc / nos_test,
+                              'MG_adv_acc': M_G_adv_acc / nos_test}.copy()
+
+        with open(log_path + "{}/{}/{}/wb_{}_attack.json".format(
+                chose_dataset, chose_model, model_layer, atk_name),"w") as p:
+            json.dump(foolrates, p)
+
+        logger.info(f"finish wb_attack_{atk_name} at {alfa}")
+
+###black box attack
+def bb_attacks(alfa):
+    global logger
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # device = torch.device('cpu')
+    # logger = set_logger()
+    if chose_dataset == 'cifar10':
+        mean = [0.4914, 0.4822, 0.4465]
+        std = [0.2023, 0.1994, 0.2010]
+        M_O = models.vgg19(pretrained=True)
+        num_ftrs = M_O.classifier[6].in_features
+        M_O.classifier[6].in_features = nn.Linear(num_ftrs, OUTPUT_DIM)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        # M_O = Net(OUTPUT_DIM, INPUT_DIM)
+        # M_G = Net(OUTPUT_DIM, INPUT_DIM)
+        #nos is number of samples
+        train_iterator, test_iterator, adv_iterator, nos_train, nos_test = cifar10_loader(logger, batch_size=cifar_batch)
+    if chose_dataset == 'cifar100':
+        mean = [0.507, 0.487, 0.441]
+        std = [0.267, 0.256, 0.276]
+        M_O = models.vgg19(pretrained=True)
+        num_ftrs = M_O.classifier[6].in_features
+        M_O.classifier[6].in_features = nn.Linear(num_ftrs, OUTPUT_DIM)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        # M_O = Net(OUTPUT_DIM, INPUT_DIM)
+        # M_G = Net(OUTPUT_DIM, INPUT_DIM)
+        #nos is number of samples
+        train_iterator, test_iterator, adv_iterator, nos_train, nos_test = cifar100_loader(logger, batch_size=cifar_batch)
+    if chose_dataset == 'svhn':
+        mean=[0.4378, 0.4439, 0.4729]
+        std=[0.1980, 0.2011, 0.1971]
+        M_O = models.vgg19(pretrained=True)
+        num_ftrs = M_O.classifier[6].in_features
+        M_O.classifier[6].in_features = nn.Linear(num_ftrs, OUTPUT_DIM)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        # M_O = Net(OUTPUT_DIM, INPUT_DIM)
+        # M_G = Net(OUTPUT_DIM, INPUT_DIM)
+        #nos is number of samples
+        train_iterator, test_iterator, adv_iterator, nos_train, nos_test = svhn_loader(logger, batch_size=svhn_batch)
+    if chose_dataset == 'mnist':
+        # mean = [0.1307]
+        # std = [0.3081]
+        preprocessing = dict(mean=[0.1307], std=[0.3081])
+        M_O = models.vgg19(pretrained=True)
+        M_O.features[0] = nn.Conv2d(1, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        num_ftrs = M_O.classifier[6].in_features
+        M_O.classifier[6].in_features = nn.Linear(num_ftrs, OUTPUT_DIM)
+        M_G = LeNet_fb(OUTPUT_DIM, INPUT_DIM)
+        train_iterator, test_iterator, adv_iterator, nos_train, nos_test = mnist_loaders(logger, batch_size=mnist_batch)
+    if chose_dataset == 'fmnist':
+        mean = [0.1307]
+        std = [0.3081]
+        M_O = models.vgg19(pretrained=True)
+        M_O.features[0] = nn.Conv2d(1, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+        num_ftrs = M_O.classifier[6].in_features
+        M_O.classifier[6].in_features = nn.Linear(num_ftrs, OUTPUT_DIM)
+        M_G = LeNet(OUTPUT_DIM, INPUT_DIM)
+        train_iterator, test_iterator, adv_iterator, nos_train, nos_test = fmnist_loaders(logger, batch_size=fmnist_batch)
+
+
+    optimizer = optim.Adam(M_O.parameters(), lr=1e-4)
+    criterion = nn.CrossEntropyLoss()
+    criterion = criterion.to(device)
+    M_O = M_O.to(device)
+    M_G = M_G.to(device)
+
+
+    if not os.path.exists(log_path + "{}/{}/{}/bb_VGG19_best.pt".format(chose_dataset, chose_model, model_layer)):
+        logger.info("training the black box VGG19")
+        train_loop(model=M_O,
+                   logger=logger,
+                   device=device,
+                   optimizer=optimizer,
+                   criterion=criterion,
+                   train_iterator=train_iterator,
+                   test_iterator=test_iterator,
+                   chk_fname = 'bb_VGG19_best',
+                   score_fname = "bb_VGG19_score",
+                   black_box = True)
+    else:
+        logger.info("the black box VGG19 is already trained")
+        chkp1 = torch.load(log_path + "{}/{}/{}/bb_VGG19_best.pt".
+                           format(chose_dataset, chose_model, model_layer), map_location=device)
+        M_O.load_state_dict(chkp1['state_dict'])
+
+    chkp2 = torch.load(log_path + "{}/{}/{}/gravity_best_{}.pt".
+                                   format(chose_dataset, chose_model, model_layer, alfa), map_location=device)
+    M_G.load_state_dict(chkp2['state_dict'])
 
     M_O.eval()
     M_G.eval()
 
-    # test_loss, test_acc = evaluate(M_O, test_iterator, criterion, device)
-    # print(f'\t M_O Val. Loss: {test_loss:.3f} |  Val. Acc: {test_acc * 100:.2f}%')
 
-    min_total, max_total = min_max(train_iterator)
-    acc_eps = {0.05:{}, 0.1:{}, 0.2:{}, 0.3:{}}
+    for atk_name in ['fgsm']:
+        logger.info(f"start bb_attack_{atk_name} at {alfa}")
+        if atk_name == 'fgsm':
+            # acc_eps = {0.05: {}, 0.1: {}, 0.3: {}, 0.7: {}, 1: {}}
+            acc_eps = [0.05, 0.1, 0.3]
+            acc_itrs = [10]*len(acc_eps)
 
-    # if chose_dataset == 'cifar10':
-    #     train_iterator, test_iterator = cifar10_loader(logger, batch_size=1)
-    # if chose_dataset == 'mnist':
-    #     train_iterator, test_iterator = mnist_loaders(logger, batch_size=1)
+        if atk_name == 'pgd':
+            # acc_itrs = {10: {}, 100: {}}
+            acc_itrs = [10, 100 , 200]
+            acc_eps = [0.3]*len(acc_itrs)
 
-    FM_O = foolbox.models.PyTorchModel(M_O, bounds=(min_total, max_total), num_classes=10)
-    attack_M_O = foolbox.attacks.FGSM(FM_O)
+        if atk_name == 'bim':
+            # acc_eps = {0.1: {}, 0.3: {}, 0.7: {}}
+            acc_eps = [0.1, 0.3, 0.7, 1]
+            acc_itrs = [10] * len(acc_eps)
+
+        if atk_name == 'mim':
+            # acc_itrs = {10: {}, 50: {}, 100: {}}
+            acc_itrs = [10, 50, 100, 200]
+            acc_eps = [0.3]*len(acc_itrs)
+
+        foolrates = defaultdict(list)
+        for acc_itr, eps in zip(acc_itrs, acc_eps):
+            M_O_adv_acc = 0
+            M_O_clean_acc = 0
+            M_G_adv_acc = 0
+            M_G_clean_acc = 0
+
+            attack_M_O = FGSM(predict=M_O, loss_fn=criterion, eps=eps, clip_min=0.0, clip_max=1.0, targeted=False)
+            # attack_M_G = FGSM(predict=M_G, loss_fn=criterion, eps=eps, clip_min=0.0, clip_max=1.0, targeted=False)
+
+            ###attack on the teacher model
+            for i, (data_batch, labels_batch) in enumerate(adv_iterator):
+                data_batch = data_batch.to(device)
+                labels_batch = labels_batch.to(device)
+                ##attack on original model
+                output = M_O(normalize(t=data_batch.clone(),
+                                       mean=preprocessing['mean'],
+                                       std=preprocessing['std'],
+                                       dataset=chose_dataset))
+                pred_cln = torch.argmax(output, dim=-1)
+                M_O_clean_acc += pred_cln.eq(labels_batch.view_as(pred_cln)).sum().item()
+
+                adv = attack_M_O.perturb(data_batch, labels_batch)
+                output = M_O(normalize(t=adv.clone(),
+                                       mean=preprocessing['mean'],
+                                       std=preprocessing['std'],
+                                       dataset=chose_dataset))
+
+                pred_adv = torch.argmax(output, dim=-1)
+                M_O_adv_acc += pred_adv.eq(labels_batch.view_as(pred_adv)).sum().item()
+
+                ##attack on robusted model
+                output = M_G(normalize(t=data_batch.clone(),
+                                       mean=preprocessing['mean'],
+                                       std=preprocessing['std'],
+                                       dataset=chose_dataset))
+
+                pred_cln = torch.argmax(output, dim=-1)
+
+                # M_O_clean_acc += np.sum(torch.argmax(pred_cln, dim=-1).cpu().numpy() == labels_batch.cpu().numpy())
+
+                M_G_clean_acc += pred_cln.eq(labels_batch.view_as(pred_cln)).sum().item()
+                output = M_G(normalize(t=adv.clone(),
+                                       mean=preprocessing['mean'],
+                                       std=preprocessing['std'],
+                                       dataset=chose_dataset))
+
+                pred_adv = torch.argmax(output, dim=-1)
+                M_G_adv_acc += pred_adv.eq(labels_batch.view_as(pred_adv)).sum().item()
+
+                logger.info(f'bb {atk_name} epsilon {eps} itr {acc_itr} Batch: {i}')
+
+            foolrates[acc_itr] = {'MO_clean_acc': M_O_clean_acc / nos_test,
+                                  'MO_adv_acc': M_O_adv_acc / nos_test,
+                                  'MG_clean_acc': M_G_clean_acc / nos_test,
+                                  'MG_adv_acc': M_G_adv_acc / nos_test}.copy()
 
 
-    teacher_adversarial_images = []
-    student_adversarial_images = []
-    for eps, _ in acc_eps.items():
-        ###attack on the teacher model
-        for i, (data_batch, labels_batch) in enumerate(train_iterator):
-            img_numpy = data_batch.cpu().numpy()
-            label_numpy = labels_batch.cpu().numpy()
-            adversarial = attack_M_O(img_numpy, label_numpy,
-                                     unpack=False, epsilons=[eps])
+            foolrates[eps] = {'MO_clean_acc': M_O_clean_acc / nos_test,
+                              'MO_adv_acc': M_O_adv_acc / nos_test,
+                              'MG_clean_acc': M_G_clean_acc / nos_test,
+                              'MG_adv_acc': M_G_adv_acc / nos_test}.copy()
 
-            ##Does this mean attack failed for input data?
-            # if adversarial[0].distance.value == 0 or adversarial[0].distance.value == np.inf:
-            if (adversarial[0] is None) or (adversarial[0].distance.value == np.inf):
-                ### for the time being
-                perturbation = np.zeros_like(img_numpy)
-                teacher_adversarial_images.append({'perturbed': img_numpy[0],
-                                                   'true_lbl': label_numpy[0],
-                                                   'adv_lbl': label_numpy[0],
-                                                   'perturbation': perturbation,
-                                                   'attack_param': eps}.copy())
-                continue
+        with open(log_path + "{}/{}/{}/bb_{}_attack.json".format(
+                chose_dataset, chose_model, model_layer, atk_name),"w") as p:
+            json.dump(foolrates, p)
 
-            perturbation = adversarial[0].unperturbed - adversarial[0].perturbed
-            result = adversarial[0].perturbed
-            teacher_adversarial_images.append({'perturbed': result,
-                                               'true_lbl': label_numpy[0],
-                                               'adv_lbl': adversarial[0].adversarial_class,
-                                               'perturbation': perturbation,
-                                                'attack_param': eps}.copy())
+        logger.info(f"finish bb_attack_{atk_name} at {alfa}")
 
-    ###attack on the student model
-    for item in teacher_adversarial_images:
-        # adversarial = attack_student(item['img'], item['true_lbl'], epsilons=2, max_epsilon=eps)
-        adversarial = item['perturbed']
-        # output_batch = M_G(torch.from_numpy(adversarial).to(device))
-        # print(adversarial.shape)
-        output_batch = M_G(torch.from_numpy(adversarial).unsqueeze(0).to(device))
-        outputs = np.argmax(output_batch.detach().cpu().numpy(), axis=1)
-        student_adversarial_images.append({'perturbed': adversarial,
-                                           'true_lbl': item['true_lbl'],
-                                           'adv_lbl': outputs[0],
-                                           'perturbation': item['perturbation'],
-                                           'attack_param': item['attack_param']}.copy())
+###white box attack
+def wb_attacks_test_bak(alfa):
+    global logger
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # device = torch.device('cpu')
+    logger = set_logger()
+    if chose_dataset == 'cifar10':
+        mean = [0.4914, 0.4822, 0.4465]
+        std = [0.2023, 0.1994, 0.2010]
+        M_O = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        # M_O = Net(OUTPUT_DIM, INPUT_DIM)
+        # M_G = Net(OUTPUT_DIM, INPUT_DIM)
+        #nos is number of samples
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = cifar10_loader(logger, batch_size=cifar_batch)
+    if chose_dataset == 'cifar100':
+        mean = [0.507, 0.487, 0.441]
+        std = [0.267, 0.256, 0.276]
+        M_O = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        # M_O = Net(OUTPUT_DIM, INPUT_DIM)
+        # M_G = Net(OUTPUT_DIM, INPUT_DIM)
+        #nos is number of samples
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = cifar100_loader(logger, batch_size=cifar_batch)
+    if chose_dataset == 'svhn':
+        mean=[0.4378, 0.4439, 0.4729]
+        std=[0.1980, 0.2011, 0.1971]
+        M_O = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        # M_O = Net(OUTPUT_DIM, INPUT_DIM)
+        # M_G = Net(OUTPUT_DIM, INPUT_DIM)
+        #nos is number of samples
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = svhn_loader(logger, batch_size=svhn_batch)
+    if chose_dataset == 'mnist':
+        # mean = [0.1307]
+        # std = [0.3081]
+        preprocessing = dict(mean=[0.1307], std=[0.3081])
+        # mean = torch.tensor(mean, requires_grad=False, device=device)
+        # std = torch.tensor(std, requires_grad=False, device=device)
+        M_O = LeNet_fb(OUTPUT_DIM, INPUT_DIM)
+        M_G = LeNet_fb(OUTPUT_DIM, INPUT_DIM)
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = mnist_loaders(logger, batch_size=mnist_batch)
 
-    M_O_df = pd.DataFrame(teacher_adversarial_images)
-    M_O_df.drop(columns=['perturbed', 'perturbation'], inplace=True)
-    M_O_df.to_csv(log_path + "{}/{}/{}/M_O_df.csv".
-                                   format(chose_dataset, chose_model, model_layer))
 
-    M_G_df = pd.DataFrame(student_adversarial_images)
-    M_G_df.drop(columns=['perturbed', 'perturbation'], inplace=True)
-    M_G_df.to_csv(log_path + "{}/{}/{}/M_G_df.csv".
-                                   format(chose_dataset, chose_model, model_layer))
+    if chose_dataset == 'fmnist':
+        mean = [0.1307]
+        std = [0.3081]
+        M_O = LeNet(OUTPUT_DIM, INPUT_DIM)
+        M_G = LeNet(OUTPUT_DIM, INPUT_DIM)
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = fmnist_loaders(logger, batch_size=fmnist_batch)
 
-main_trainer()
-wb_original_attacker()
-wb_gravity_attacker()
-bb_attacker()
+    chkp1 = torch.load(log_path + "{}/{}/{}/original_best.pt".
+                                   format(chose_dataset, chose_model, model_layer), map_location=device)
+    M_O.load_state_dict(chkp1['state_dict'])
+
+    chkp2 = torch.load(log_path + "{}/{}/{}/gravity_best_{}.pt".
+                                   format(chose_dataset, chose_model, model_layer, alfa), map_location=device)
+    M_G.load_state_dict(chkp2['state_dict'])
+
+    M_O = M_O.to(device)
+    M_G = M_G.to(device)
+    M_O.eval()
+    M_G.eval()
+
+    optimizer = optim.Adam(M_O.parameters(), lr=1e-4)
+    criterion = nn.CrossEntropyLoss()
+    criterion = criterion.to(device)
+
+    for atk_name in ['fgsm']:
+        logger.info(f"start wb_attack_{atk_name} at {alfa}")
+        if atk_name == 'fgsm':
+            # acc_eps = {0.05: {}, 0.1: {}, 0.3: {}, 0.7: {}, 1: {}}
+            acc_eps = [0.0, 0.01, 0.05, 0.1, 0.3]
+            acc_itrs = [1]*len(acc_eps)
+            FM_O = foolbox.models.PyTorchModel(M_O, bounds=(0, 1), num_classes=OUTPUT_DIM, preprocessing=preprocessing)
+            attack_M_O = foolbox.attacks.FGSM(FM_O)
+
+            FM_G = foolbox.models.PyTorchModel(M_G, bounds=(0, 1), num_classes=OUTPUT_DIM, preprocessing=preprocessing)
+            attack_M_G = foolbox.attacks.FGSM(FM_G)
+        if atk_name == 'pgd':
+            # acc_itrs = {10: {}, 100: {}}
+            acc_itrs = [10, 20]
+            acc_eps = [0.3]*len(acc_itrs)
+
+            FM_O = foolbox.models.PyTorchModel(M_O, bounds=(0, 1), num_classes=OUTPUT_DIM, preprocessing=preprocessing)
+            attack_M_O = foolbox.attacks.PGD(FM_O)
+
+            FM_G = foolbox.models.PyTorchModel(M_G, bounds=(0, 1), num_classes=OUTPUT_DIM, preprocessing=preprocessing)
+            attack_M_G = foolbox.attacks.PGD(FM_G)
+
+        if atk_name == 'bim':
+            # acc_eps = {0.1: {}, 0.3: {}, 0.7: {}}
+            acc_eps = [0.1, 0.3]
+            acc_itrs = [10] * len(acc_eps)
+
+        if atk_name == 'mim':
+            # acc_itrs = {10: {}, 50: {}, 100: {}}
+            acc_itrs = [10, 20]
+            acc_eps = [0.3]*len(acc_itrs)
+
+        foolrates = defaultdict(list)
+        for acc_itr, eps in zip(acc_itrs, acc_eps):
+            M_O_adv_acc = 0
+            M_O_clean_acc = 0
+            M_G_adv_acc = 0
+            M_G_clean_acc = 0
+            ###attack on the teacher model
+            for i, (data_batch, labels_batch) in enumerate(adv_iterator):
+                data_batch = data_batch.cpu().numpy()
+                labels_batch = labels_batch.cpu().numpy()
+                # data_batch = data_batch.to(device)
+                # labels_batch = labels_batch.to(device)
+
+
+                ##attack on original model
+                # M_O_clean_acc += torch.sum(
+                #     M_O(normalize(data_batch.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+                # adv = attack_M_O(data_batch, labels_batch, epsilon=eps, iterations=acc_itr)
+                adv = attack_M_O(data_batch, labels_batch, epsilons=[eps])
+                # print(len(adv_))
+                # print(dir(adv_[0]))
+                # exit()
+
+                # perturbation = np.array([x.gradient_one for x in adv_])
+                M_O_clean_acc += np.sum(FM_O.forward(data_batch).argmax(axis=-1) == labels_batch)
+                # M_O_clean_acc += np.sum(FM_O.forward(normalize(t=copy.deepcopy(data_batch),
+                #                                                mean=preprocessing['mean'],
+                #                                                std=preprocessing['std'],
+                #                                                 dataset=chose_dataset)).argmax(axis=-1) ==
+                # print(dir(perturbation[0]))
+                # adv = data_batch+perturbation
+                M_O_adv_acc += np.sum(FM_O.forward(copy.deepcopy(adv)).argmax(axis=-1) == labels_batch)
+                # M_O_adv_acc += np.sum(FM_O.forward(normalize(t=copy.deepcopy(data_batch+perturbation),
+                #                                              mean=preprocessing['mean'],
+                #                                              std=preprocessing['std'],
+                #                                              dataset=chose_dataset)).argmax(axis=-1) == labels_batch)
+
+
+                # adv = attack_M_G(data_batch, labels_batch, epsilon=eps, iterations=acc_itr)
+                adv = attack_M_G(data_batch, labels_batch, epsilons=[eps])
+                # perturbation = np.array([x.unperturbed for x in adv_]) - np.array([y.unperturbed for y in adv_])
+                # perturbation = np.array([x.gradient_one for x in adv_])
+                M_G_clean_acc += np.sum(FM_G.forward(data_batch).argmax(axis=-1) == labels_batch)
+
+                M_G_adv_acc += np.sum(FM_G.forward(adv).argmax(axis=-1) == labels_batch)
+                # M_G_clean_acc += np.sum(FM_G.forward(normalize(t=copy.deepcopy(data_batch),
+                #                                                mean=preprocessing['mean'],
+                #                                                std=preprocessing['std'],
+                #                                                dataset=chose_dataset)).argmax(axis=-1) == labels_batch)
+                #
+                # M_G_adv_acc += np.sum(FM_G.forward(normalize(t=copy.deepcopy(data_batch+perturbation),
+                #                                              mean=preprocessing['mean'],
+                #                                              std=preprocessing['std'],
+                #                                              dataset=chose_dataset)).argmax(axis=-1) == labels_batch)
+                # M_G_clean_acc += np.sum(FM_G.forward(data_batch).argmax(axis=-1) == labels_batch)
+                # M_G_adv_acc += np.sum(FM_G.forward(adv).argmax(axis=-1) == labels_batch)
+
+                # M_O_clean_acc += foolbox.utils.accuracy(FM_G, data_batch, labels_batch)
+                # M_O_adv_acc += foolbox.utils.accuracy(FM_G, adv, labels_batch)
+
+                # # data_batch.grad.data.zero_()
+                # data_batch_  = normalize(data_batch.clone().detach(), mean, std, chose_dataset)
+                # data_batch_.requires_grad = True
+                # out_adv, _, _ = M_O(data_batch_)
+                # loss = criterion(out_adv, labels_batch)
+                # # loss = F.nll_loss(out_adv, label)
+                # M_O.zero_grad()
+                # # data_batch_.register_hook(print)
+                # loss.backward()
+                #
+                # # noise = data_batch_.grad.data.sign()
+                # noise = torch.sign(data_batch_.grad.data)
+                #
+                # # noise = [0]
+                # # print('noise')
+                # # print(noise[0])
+                # # print(torch.sum(torch.abs(noise)))
+                # adv = data_batch + eps * noise
+                # # print('adv')
+                # # print(adv[0])
+                # adv = torch.clamp(adv, 0, 1)
+                # # print('adv clamp')
+                # # print(adv[0])
+                # # exit()
+                #
+                # # adv = attack(model=M_O,
+                # #              criterion=criterion,
+                # #              img=data_batch,
+                # #              label=labels_batch,
+                # #              eps=eps,
+                # #              attack_type=atk_name,
+                # #              iters=acc_itr,
+                # #              mean=mean,
+                # #              std=std,
+                # #              dataset=chose_dataset,
+                # #              black_box=False)
+                # M_O_adv_acc += torch.sum(
+                #     M_O(normalize(adv.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+                #
+                #
+                # ##attack on robusted model
+                # M_G_clean_acc += torch.sum(
+                #     M_G(normalize(data_batch.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+                #
+                # # data_batch.requires_grad = True
+                # # data_batch.grad.data.zero_()
+                # data_batch_.grad.data.zero_()
+                # M_G.zero_grad()
+                # out_adv, _, _ = M_G(normalize(data_batch.clone().detach(), mean, std, chose_dataset))
+                # loss = criterion(out_adv, labels_batch)
+                # # loss = F.nll_loss(out_adv, label)
+                # loss.backward()
+                #
+                # noise = torch.sign(data_batch_.grad.data)
+                # adv = data_batch + eps * noise
+                # adv = torch.clamp(adv, 0, 1)
+                # # data_batch.grad.data.zero_()
+                # # adv = attack(model=M_G,
+                # #              criterion=criterion,
+                # #              img=data_batch,
+                # #              label=labels_batch,
+                # #              eps=eps,
+                # #              attack_type=atk_name,
+                # #              iters=acc_itr,
+                # #              mean=mean,
+                # #              std=std,
+                # #              dataset=chose_dataset,
+                # #              black_box=False)
+                # M_G_adv_acc += torch.sum(
+                #     M_G(normalize(adv.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+                logger.info(f'wb {atk_name} epsilon {eps} itr {acc_itr} Batch: {i}')
+
+            foolrates[acc_itr] = {'MO_clean_acc': M_O_clean_acc / nos_test,
+                                  'MO_adv_acc': M_O_adv_acc / nos_test,
+                                  'MG_clean_acc': M_G_clean_acc / nos_test,
+                                  'MG_adv_acc': M_G_adv_acc / nos_test}.copy()
+
+            foolrates[eps] = {'MO_clean_acc': M_O_clean_acc / nos_test,
+                              'MO_adv_acc': M_O_adv_acc / nos_test,
+                              'MG_clean_acc': M_G_clean_acc / nos_test,
+                              'MG_adv_acc': M_G_adv_acc / nos_test}.copy()
+            # foolrates[acc_itr] = {'MO_clean_acc': M_O_clean_acc / len(adv_iterator),
+            #                       'MO_adv_acc': M_O_adv_acc / len(adv_iterator),
+            #                       'MG_clean_acc': M_G_clean_acc / len(adv_iterator),
+            #                       'MG_adv_acc': M_G_adv_acc / len(adv_iterator)}.copy()
+            #
+            # foolrates[eps] = {'MO_clean_acc': M_O_clean_acc / len(adv_iterator),
+            #                   'MO_adv_acc': M_O_adv_acc / len(adv_iterator),
+            #                   'MG_clean_acc': M_G_clean_acc / len(adv_iterator),
+            #                   'MG_adv_acc': M_G_adv_acc / len(adv_iterator)}.copy()
+
+        with open(log_path + "{}/{}/{}/wb_{}_attack_test.json".format(
+                chose_dataset, chose_model, model_layer, atk_name),"w") as p:
+            json.dump(foolrates, p)
+
+        logger.info(f"finish wb_attack_test{atk_name} at {alfa}")
+
+###white box attack
+def wb_attacks_test_bak(alfa):
+    global logger
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # device = torch.device('cpu')
+    logger = set_logger()
+    if chose_dataset == 'cifar10':
+        mean = [0.4914, 0.4822, 0.4465]
+        std = [0.2023, 0.1994, 0.2010]
+        M_O = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        # M_O = Net(OUTPUT_DIM, INPUT_DIM)
+        # M_G = Net(OUTPUT_DIM, INPUT_DIM)
+        #nos is number of samples
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = cifar10_loader(logger, batch_size=cifar_batch)
+    if chose_dataset == 'cifar100':
+        mean = [0.507, 0.487, 0.441]
+        std = [0.267, 0.256, 0.276]
+        M_O = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        # M_O = Net(OUTPUT_DIM, INPUT_DIM)
+        # M_G = Net(OUTPUT_DIM, INPUT_DIM)
+        #nos is number of samples
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = cifar100_loader(logger, batch_size=cifar_batch)
+    if chose_dataset == 'svhn':
+        mean=[0.4378, 0.4439, 0.4729]
+        std=[0.1980, 0.2011, 0.1971]
+        M_O = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        # M_O = Net(OUTPUT_DIM, INPUT_DIM)
+        # M_G = Net(OUTPUT_DIM, INPUT_DIM)
+        #nos is number of samples
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = svhn_loader(logger, batch_size=svhn_batch)
+    if chose_dataset == 'mnist':
+        # mean = [0.1307]
+        # std = [0.3081]
+        preprocessing = dict(mean=[0.1307], std=[0.3081])
+        # mean = torch.tensor(mean, requires_grad=False, device=device)
+        # std = torch.tensor(std, requires_grad=False, device=device)
+        M_O = LeNet_fb(OUTPUT_DIM, INPUT_DIM)
+        M_G = LeNet_fb(OUTPUT_DIM, INPUT_DIM)
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = mnist_loaders(logger, batch_size=mnist_batch)
+
+
+    if chose_dataset == 'fmnist':
+        mean = [0.1307]
+        std = [0.3081]
+        M_O = LeNet(OUTPUT_DIM, INPUT_DIM)
+        M_G = LeNet(OUTPUT_DIM, INPUT_DIM)
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = fmnist_loaders(logger, batch_size=fmnist_batch)
+
+    chkp1 = torch.load(log_path + "{}/{}/{}/original_best.pt".
+                                   format(chose_dataset, chose_model, model_layer), map_location=device)
+    M_O.load_state_dict(chkp1['state_dict'])
+
+    chkp2 = torch.load(log_path + "{}/{}/{}/gravity_best_{}.pt".
+                                   format(chose_dataset, chose_model, model_layer, alfa), map_location=device)
+    M_G.load_state_dict(chkp2['state_dict'])
+
+    M_O = M_O.to(device)
+    M_G = M_G.to(device)
+    M_O.eval()
+    M_G.eval()
+
+    optimizer = optim.Adam(M_O.parameters(), lr=1e-4)
+    criterion = nn.CrossEntropyLoss()
+    criterion = criterion.to(device)
+
+    for atk_name in ['fgsm']:
+        logger.info(f"start wb_attack_{atk_name} at {alfa}")
+        if atk_name == 'fgsm':
+            # acc_eps = {0.05: {}, 0.1: {}, 0.3: {}, 0.7: {}, 1: {}}
+            acc_eps = [ 0.3, 0.4, 0.5, 1, 10]
+            acc_itrs = [1]*len(acc_eps)
+            FM_O = foolbox.models.PyTorchModel(M_O, bounds=(0, 1), num_classes=OUTPUT_DIM, preprocessing=preprocessing)
+            attack_M_O = foolbox.attacks.FGSM(FM_O)
+
+            FM_G = foolbox.models.PyTorchModel(M_G, bounds=(0, 1), num_classes=OUTPUT_DIM, preprocessing=preprocessing)
+            attack_M_G = foolbox.attacks.FGSM(FM_G)
+        if atk_name == 'pgd':
+            # acc_itrs = {10: {}, 100: {}}
+            acc_itrs = [10, 20]
+            acc_eps = [0.3]*len(acc_itrs)
+
+            FM_O = foolbox.models.PyTorchModel(M_O, bounds=(0, 1), num_classes=OUTPUT_DIM, preprocessing=preprocessing)
+            attack_M_O = foolbox.attacks.PGD(FM_O)
+
+            FM_G = foolbox.models.PyTorchModel(M_G, bounds=(0, 1), num_classes=OUTPUT_DIM, preprocessing=preprocessing)
+            attack_M_G = foolbox.attacks.PGD(FM_G)
+
+        if atk_name == 'bim':
+            # acc_eps = {0.1: {}, 0.3: {}, 0.7: {}}
+            acc_eps = [0.1, 0.3]
+            acc_itrs = [10] * len(acc_eps)
+
+        if atk_name == 'mim':
+            # acc_itrs = {10: {}, 50: {}, 100: {}}
+            acc_itrs = [10, 20]
+            acc_eps = [0.3]*len(acc_itrs)
+
+        foolrates = defaultdict(list)
+        for acc_itr, eps in zip(acc_itrs, acc_eps):
+            M_O_adv_acc = 0
+            M_O_clean_acc = 0
+            M_G_adv_acc = 0
+            M_G_clean_acc = 0
+            ###attack on the teacher model
+            for i, (data_batch, labels_batch) in enumerate(adv_iterator):
+                data_batch = data_batch.to(device)
+                labels_batch = labels_batch.to(device)
+
+
+
+                data_batch_ = normalize(t=data_batch.clone(),
+                                       mean=preprocessing['mean'],
+                                       std=preprocessing['std'],
+                                       dataset=chose_dataset)
+                data_batch_.requires_grad = True
+                output = M_O(data_batch_)
+                # output = M_O(data_batch)
+                loss = F.cross_entropy(output, labels_batch)
+                M_O.zero_grad()
+                loss.backward()
+
+                data_grad = data_batch_.grad
+                # unnormalized gradient
+                data_grad_ = un_normalize(data_grad.clone(),
+                                          mean=preprocessing['mean'],
+                                          std=preprocessing['std'],
+                                          dataset=chose_dataset)
+
+                # FGSM attack code
+                def fgsm_attack(image, epsilon, data_grad):
+
+                    # Collect the element-wise sign of the data gradient
+                    sign_data_grad = data_grad.sign()
+                    # Create the perturbed image by adjusting each pixel of the input image
+                    perturbed_image = image + epsilon * sign_data_grad
+                    # Adding clipping to maintain [0,1] range
+                    perturbed_image = torch.clamp(perturbed_image, 0, 1)
+                    # Return the perturbed image
+                    return perturbed_image
+
+                perturbed_data = fgsm_attack(image=data_batch, epsilon=eps, data_grad=data_grad_)
+                # output = M_O(normalize(perturbed_data,preprocessing['mean'],preprocessing['std'],chose_dataset))
+                output = M_O(perturbed_data)
+                M_O_adv_acc += np.sum(torch.argmax(output, dim=-1).cpu().numpy() == labels_batch.cpu().numpy())
+
+                # output = M_G(normalize(perturbed_data,preprocessing['mean'],preprocessing['std'],chose_dataset))
+                output = M_G(perturbed_data)
+                M_G_adv_acc += np.sum(torch.argmax(output, dim=-1).cpu().numpy() == labels_batch.cpu().numpy())
+
+
+                logger.info(f'wb {atk_name} epsilon {eps} itr {acc_itr} Batch: {i}')
+
+            foolrates[acc_itr] = {'MO_clean_acc': M_O_clean_acc / nos_test,
+                                  'MO_adv_acc': M_O_adv_acc / nos_test,
+                                  'MG_clean_acc': M_G_clean_acc / nos_test,
+                                  'MG_adv_acc': M_G_adv_acc / nos_test}.copy()
+
+            foolrates[eps] = {'MO_clean_acc': M_O_clean_acc / nos_test,
+                              'MO_adv_acc': M_O_adv_acc / nos_test,
+                              'MG_clean_acc': M_G_clean_acc / nos_test,
+                              'MG_adv_acc': M_G_adv_acc / nos_test}.copy()
+            # foolrates[acc_itr] = {'MO_clean_acc': M_O_clean_acc / len(adv_iterator),
+            #                       'MO_adv_acc': M_O_adv_acc / len(adv_iterator),
+            #                       'MG_clean_acc': M_G_clean_acc / len(adv_iterator),
+            #                       'MG_adv_acc': M_G_adv_acc / len(adv_iterator)}.copy()
+            #
+            # foolrates[eps] = {'MO_clean_acc': M_O_clean_acc / len(adv_iterator),
+            #                   'MO_adv_acc': M_O_adv_acc / len(adv_iterator),
+            #                   'MG_clean_acc': M_G_clean_acc / len(adv_iterator),
+            #                   'MG_adv_acc': M_G_adv_acc / len(adv_iterator)}.copy()
+
+        with open(log_path + "{}/{}/{}/wb_{}_attack_test.json".format(
+                chose_dataset, chose_model, model_layer, atk_name),"w") as p:
+            json.dump(foolrates, p)
+
+        logger.info(f"finish wb_attack_test{atk_name} at {alfa}")
+
+###white box attack
+def wb_attacks_test(alfa):
+    global logger
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # device = torch.device('cpu')
+    logger = set_logger()
+    if chose_dataset == 'cifar10':
+        mean = [0.4914, 0.4822, 0.4465]
+        std = [0.2023, 0.1994, 0.2010]
+        M_O = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        # M_O = Net(OUTPUT_DIM, INPUT_DIM)
+        # M_G = Net(OUTPUT_DIM, INPUT_DIM)
+        #nos is number of samples
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = cifar10_loader(logger, batch_size=cifar_batch)
+    if chose_dataset == 'cifar100':
+        mean = [0.507, 0.487, 0.441]
+        std = [0.267, 0.256, 0.276]
+        M_O = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        # M_O = Net(OUTPUT_DIM, INPUT_DIM)
+        # M_G = Net(OUTPUT_DIM, INPUT_DIM)
+        #nos is number of samples
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = cifar100_loader(logger, batch_size=cifar_batch)
+    if chose_dataset == 'svhn':
+        mean=[0.4378, 0.4439, 0.4729]
+        std=[0.1980, 0.2011, 0.1971]
+        M_O = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        M_G = resnet(num_classes=OUTPUT_DIM, depth=110, layer=model_layer)
+        # M_O = Net(OUTPUT_DIM, INPUT_DIM)
+        # M_G = Net(OUTPUT_DIM, INPUT_DIM)
+        #nos is number of samples
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = svhn_loader(logger, batch_size=svhn_batch)
+    if chose_dataset == 'mnist':
+        # mean = [0.1307]
+        # std = [0.3081]
+        preprocessing = dict(mean=[0.1307], std=[0.3081])
+        # mean = torch.tensor(mean, requires_grad=False, device=device)
+        # std = torch.tensor(std, requires_grad=False, device=device)
+        M_O = LeNet_fb(OUTPUT_DIM, INPUT_DIM)
+        M_G = LeNet_fb(OUTPUT_DIM, INPUT_DIM)
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = mnist_loaders(logger, batch_size=mnist_batch)
+
+
+    if chose_dataset == 'fmnist':
+        mean = [0.1307]
+        std = [0.3081]
+        M_O = LeNet(OUTPUT_DIM, INPUT_DIM)
+        M_G = LeNet(OUTPUT_DIM, INPUT_DIM)
+        train_iterator, test_iterator,adv_iterator, nos_train, nos_test = fmnist_loaders(logger, batch_size=fmnist_batch)
+
+    chkp1 = torch.load(log_path + "{}/{}/{}/original_best.pt".
+                                   format(chose_dataset, chose_model, model_layer), map_location=device)
+    M_O.load_state_dict(chkp1['state_dict'])
+
+    chkp2 = torch.load(log_path + "{}/{}/{}/gravity_best_{}.pt".
+                                   format(chose_dataset, chose_model, model_layer, alfa), map_location=device)
+    M_G.load_state_dict(chkp2['state_dict'])
+
+    M_O = M_O.to(device)
+    M_G = M_G.to(device)
+    M_O.eval()
+    M_G.eval()
+
+    optimizer = optim.Adam(M_O.parameters(), lr=1e-4)
+    criterion = nn.CrossEntropyLoss()
+    criterion = criterion.to(device)
+
+    for atk_name in ['fgsm']:
+        logger.info(f"start wb_attack_{atk_name} at {alfa}")
+        if atk_name == 'fgsm':
+            # acc_eps = {0.05: {}, 0.1: {}, 0.3: {}, 0.7: {}, 1: {}}
+            acc_eps = [0.0, 0.01, 0.05, 0.1, 0.3]
+            acc_itrs = [1]*len(acc_eps)
+
+        if atk_name == 'pgd':
+            # acc_itrs = {10: {}, 100: {}}
+            acc_itrs = [10, 20]
+            acc_eps = [0.3]*len(acc_itrs)
+
+            FM_O = foolbox.models.PyTorchModel(M_O, bounds=(0, 1), num_classes=OUTPUT_DIM, preprocessing=preprocessing)
+            attack_M_O = foolbox.attacks.PGD(FM_O)
+
+            FM_G = foolbox.models.PyTorchModel(M_G, bounds=(0, 1), num_classes=OUTPUT_DIM, preprocessing=preprocessing)
+            attack_M_G = foolbox.attacks.PGD(FM_G)
+
+        if atk_name == 'bim':
+            # acc_eps = {0.1: {}, 0.3: {}, 0.7: {}}
+            acc_eps = [0.1, 0.3]
+            acc_itrs = [10] * len(acc_eps)
+
+        if atk_name == 'mim':
+            # acc_itrs = {10: {}, 50: {}, 100: {}}
+            acc_itrs = [10, 20]
+            acc_eps = [0.3]*len(acc_itrs)
+
+        foolrates = defaultdict(list)
+        for acc_itr, eps in zip(acc_itrs, acc_eps):
+            M_O_adv_acc = 0
+            M_O_clean_acc = 0
+            M_G_adv_acc = 0
+            M_G_clean_acc = 0
+
+            attack_M_O = FGSM(predict=M_O, loss_fn=criterion, eps=eps, clip_min=0.0, clip_max=1.0, targeted=False)
+            attack_M_G = FGSM(predict=M_G, loss_fn=criterion, eps=eps, clip_min=0.0, clip_max=1.0, targeted=False)
+            ###attack on the teacher model
+            for i, (data_batch, labels_batch) in enumerate(adv_iterator):
+                data_batch = data_batch.to(device)
+                labels_batch = labels_batch.to(device)
+                # data_batch = data_batch.to(device)
+                # labels_batch = labels_batch.to(device)
+
+
+                ##attack on original model
+                # M_O_clean_acc += torch.sum(
+                #     M_O(normalize(data_batch.clone().detach(), mean, std, chose_dataset))[0].argmax(dim=-1) == labels_batch).item()
+
+                # adv = attack_M_O(data_batch, labels_batch, epsilon=eps, iterations=acc_itr)
+                output = M_O(normalize(t=data_batch.clone(),
+                                       mean=preprocessing['mean'],
+                                       std=preprocessing['std'],
+                                       dataset=chose_dataset))
+
+                pred_cln = torch.argmax(output, dim=-1)
+
+                # M_O_clean_acc += np.sum(torch.argmax(pred_cln, dim=-1).cpu().numpy() == labels_batch.cpu().numpy())
+
+                M_O_clean_acc += pred_cln.eq(labels_batch.view_as(pred_cln)).sum().item()
+
+                adv = attack_M_O.perturb(data_batch, labels_batch)
+                output = M_O(normalize(t=adv.clone(),
+                                       mean=preprocessing['mean'],
+                                       std=preprocessing['std'],
+                                       dataset=chose_dataset))
+
+                pred_adv = torch.argmax(output, dim=-1)
+                M_O_adv_acc += pred_adv.eq(labels_batch.view_as(pred_adv)).sum().item()
+
+                ###student section
+                output = M_G(normalize(t=data_batch.clone(),
+                                       mean=preprocessing['mean'],
+                                       std=preprocessing['std'],
+                                       dataset=chose_dataset))
+
+                pred_cln = torch.argmax(output, dim=-1)
+
+                # M_O_clean_acc += np.sum(torch.argmax(pred_cln, dim=-1).cpu().numpy() == labels_batch.cpu().numpy())
+
+                M_G_clean_acc += pred_cln.eq(labels_batch.view_as(pred_cln)).sum().item()
+
+                adv = attack_M_G.perturb(data_batch, labels_batch)
+                output = M_G(normalize(t=adv.clone(),
+                                       mean=preprocessing['mean'],
+                                       std=preprocessing['std'],
+                                       dataset=chose_dataset))
+
+                pred_adv = torch.argmax(output, dim=-1)
+                M_G_adv_acc += pred_adv.eq(labels_batch.view_as(pred_adv)).sum().item()
+
+                logger.info(f'wb {atk_name} epsilon {eps} itr {acc_itr} Batch: {i}')
+
+            foolrates[acc_itr] = {'MO_clean_acc': M_O_clean_acc / nos_test,
+                                  'MO_adv_acc': M_O_adv_acc / nos_test,
+                                  'MG_clean_acc': M_G_clean_acc / nos_test,
+                                  'MG_adv_acc': M_G_adv_acc / nos_test}.copy()
+
+            foolrates[eps] = {'MO_clean_acc': M_O_clean_acc / nos_test,
+                              'MO_adv_acc': M_O_adv_acc / nos_test,
+                              'MG_clean_acc': M_G_clean_acc / nos_test,
+                              'MG_adv_acc': M_G_adv_acc / nos_test}.copy()
+            # foolrates[acc_itr] = {'MO_clean_acc': M_O_clean_acc / len(adv_iterator),
+            #                       'MO_adv_acc': M_O_adv_acc / len(adv_iterator),
+            #                       'MG_clean_acc': M_G_clean_acc / len(adv_iterator),
+            #                       'MG_adv_acc': M_G_adv_acc / len(adv_iterator)}.copy()
+            #
+            # foolrates[eps] = {'MO_clean_acc': M_O_clean_acc / len(adv_iterator),
+            #                   'MO_adv_acc': M_O_adv_acc / len(adv_iterator),
+            #                   'MG_clean_acc': M_G_clean_acc / len(adv_iterator),
+            #                   'MG_adv_acc': M_G_adv_acc / len(adv_iterator)}.copy()
+
+        with open(log_path + "{}/{}/{}/wb_{}_attack_test.json".format(
+                chose_dataset, chose_model, model_layer, atk_name),"w") as p:
+            json.dump(foolrates, p)
+
+        logger.info(f"finish wb_attack_test{atk_name} at {alfa}")
+
+# main_trainer()
+ # wb_original_attacker()
+# wb_gravity_attacker()
+# bb_attacker()
+selected_alfa = best_alfa(name='distances.csv')
+wb_attacks_test(alfa=selected_alfa)
+# wb_attacks(alfa=selected_alfa)
+bb_attacks(alfa=selected_alfa)
+# wb_attack_fgsm(alfa=selected_alfa)
+# wb_attack_pgd(alfa=selected_alfa)
+# wb_attack_bim(alfa=selected_alfa)
+# wb_attack_mim(alfa=selected_alfa)
+# bb_attack_fgsm(alfa=selected_alfa)
+# bb_attack_pgd(alfa=selected_alfa)
+# bb_attack_bim(alfa=selected_alfa)
+# bb_attack_mim(alfa=selected_alfa)
+# wb_attack_cw(alfa=selected_alfa)
+

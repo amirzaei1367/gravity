@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name gravity
+#SBATCH --job-name gr_m_1test
 #SBATCH --partition gpuq
 #SBATCH --nodes 1
 ###SBATCH --nodelist=NODE076
@@ -9,15 +9,17 @@
 ###SBATCH --array=98-99
 ####SBATCH --output=/scratch/amirzaei/cluster_kd/kd_2clusters_%a/cluster0/extractor_%N_%j.log 
 ###SBATCH --output=/scratch/amirzaei/cluster_kd/kd_2clusters_%a/cluster0/extractor.log 
-#SBATCH --output=/scratch/amirzaei/projects/gravity/log_dir/gravity.log
+#SBATCH --output=/scratch/amirzaei/projects/gravity/log_dir/%x.log
 ###SBATCH --output=/scratch/amirzaei/cifar100/extractor_%N_%j.log 
 ###SBATCH --output=/scratch/amirzaei/cluster_kd/kd_2clusters_%a/cluster1/extractor_%N_%j.log 
-#SBATCH --mem 20000
+#SBATCH --mem 50000
 ##SBATCH --qos=hhqos
-#SBATCH --reservation=amirzaei_75
+###SBATCH --reservation=amirzaei_75
 
 ##module load cuda80/toolkit/8.0.44
 ##module purge
+#export GIT_PYTHON_REFRESH=quiet
+#module load pytorch/1.4.0-p36
 module load python/3.6.7
 source /home/amirzaei/venv/bin/activate
 ##
