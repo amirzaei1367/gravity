@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name gr_m_1test
+#SBATCH --job-name gr_m_2
 #SBATCH --partition gpuq
 #SBATCH --nodes 1
 ###SBATCH --nodelist=NODE076
@@ -15,6 +15,7 @@
 #SBATCH --mem 50000
 ##SBATCH --qos=hhqos
 ###SBATCH --reservation=amirzaei_75
+###SBATCH --time=0-12:0
 
 ##module load cuda80/toolkit/8.0.44
 ##module purge
@@ -25,6 +26,7 @@ source /home/amirzaei/venv/bin/activate
 ##
 ##module load python/python2.7
 ##module load pytorch/0.4.1-py36
+
 
 
 
