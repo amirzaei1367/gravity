@@ -246,7 +246,7 @@ def resnet(**kwargs):
 class ResNet_fb(nn.Module):
 
     def __init__(self, depth, num_classes=10, layer=-1):
-        super(ResNet, self).__init__()
+        super(ResNet_fb, self).__init__()
         self.layer = layer
         # Model type specifies number of layers for CIFAR-10 model
         assert (depth - 2) % 6 == 0, 'depth should be 6n+2'
@@ -428,23 +428,186 @@ def resnet_fb(**kwargs):
 #         x = F.softmax(x)
 #         return x
 
+# class LeNet(nn.Module):
+#     def __init__(self, output_dim, input_dim=1, layer=-1):
+#         super().__init__()
+#
+#         self.layer = layer
+#
+#         self.conv1 = nn.Conv2d(in_channels=input_dim,
+#                                out_channels=32,
+#                                kernel_size=5)
+#         self.bn1 = nn.BatchNorm2d(32)
+#
+#         self.conv2 = nn.Conv2d(in_channels=32,
+#                                out_channels=64,
+#                                kernel_size=5)
+#         self.bn2 = nn.BatchNorm2d(64)
+#
+#         self.fc1 = nn.Linear(64 * 5 * 5, 512)
+#
+#         self.fc2 = nn.Linear(512, 64)
+#
+#         self.fc3 = nn.Linear(64, output_dim)
+#
+#     def forward(self, x):
+#         x = self.conv1(x)
+#         # z = x.view(x.shape[0], -1)
+#         x = self.bn1(x)
+#         x = F.relu(x)
+#         x = F.max_pool2d(x, kernel_size=2)
+#
+#         x = self.conv2(x)
+#         x = self.bn2(x)
+#         if self.layer == -5:
+#             z = (x.view(x.shape[0], -1)).clone()
+#
+#         x = F.relu(x)
+#         x = F.max_pool2d(x, kernel_size=2)
+#
+#         x = x.view(x.shape[0], -1)
+#         if self.layer == -4:
+#             z = x.clone()
+#
+#         x = self.fc1(x)
+#         if self.layer == -3:
+#             z = x.clone()
+#
+#         x = F.relu(x)
+#
+#         x = self.fc2(x)
+#         if self.layer == -2:
+#             z = x.clone()
+#
+#         x = F.relu(x)
+#
+#         x = self.fc3(x)
+#         if self.layer == -1:
+#             z = x.clone()
+#
+#         l_1 = x.clone()
+#
+#         x = F.softmax(x)
+#         return x, l_1, z
+#
+# class LeNet_fb(nn.Module):
+#     def __init__(self, output_dim, input_dim=1):
+#         super(LeNet_fb, self).__init__()
+#
+#         self.conv1 = nn.Conv2d(in_channels=input_dim,
+#                                out_channels=32,
+#                                kernel_size=5)
+#         self.bn1 = nn.BatchNorm2d(32)
+#
+#         self.conv2 = nn.Conv2d(in_channels=32,
+#                                out_channels=64,
+#                                kernel_size=5)
+#         self.bn2 = nn.BatchNorm2d(64)
+#
+#         self.fc1 = nn.Linear(64 * 5 * 5, 512)
+#
+#         self.fc2 = nn.Linear(512, 64)
+#
+#         self.fc3 = nn.Linear(64, output_dim)
+#
+#     def forward(self, x):
+#         x = self.conv1(x)
+#         x = self.bn1(x)
+#         x = F.relu(x)
+#         x = F.max_pool2d(x, kernel_size=2)
+#
+#         x = self.conv2(x)
+#         x = self.bn2(x)
+#         x = F.relu(x)
+#         x = F.max_pool2d(x, kernel_size=2)
+#
+#         x = x.view(x.shape[0], -1)
+#
+#         x = self.fc1(x)
+#         x = F.relu(x)
+#
+#         x = self.fc2(x)
+#
+#         x = F.relu(x)
+#
+#         x = self.fc3(x)
+#
+#         x = F.softmax(x)
+#         return x
+
+class MLeNet(nn.Module):
+    def __init__(self, output_dim, input_dim ):
+        super(MLeNet, self).__init__()
+        self.layer1 = nn.Sequential(
+            nn.Conv2d(input_dim, 16, kernel_size=5, padding=2),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.MaxPool2d(2))
+        self.layer2 = nn.Sequential(
+            nn.Conv2d(16, 128, kernel_size=5, padding=2),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(2))
+
+        self.fc1 = nn.Linear(128*8*8, 512)
+
+        self.fc2 = nn.Linear(512, 64)
+
+        self.fc3 = nn.Linear(64, output_dim)
+
+    def forward(self, x):
+        out = self.layer1(x)
+        out = self.layer2(out)
+        out = out.view(out.size(0), -1)
+        out = self.fc1(out)
+        out = self.fc2(out)
+        out = self.fc3(out)
+
+        return out
+
 class LeNet(nn.Module):
     def __init__(self, output_dim, input_dim=1, layer=-1):
-        super().__init__()
+        super(LeNet, self).__init__()
 
         self.layer = layer
 
         self.conv1 = nn.Conv2d(in_channels=input_dim,
                                out_channels=32,
-                               kernel_size=5)
+                               kernel_size=5,
+                               padding=(2,2))
+
+        self.conv1_1 = nn.Conv2d(in_channels=32,
+                                 out_channels=32,
+                                 kernel_size=5,
+                                 padding=(2,2))
+
         self.bn1 = nn.BatchNorm2d(32)
 
         self.conv2 = nn.Conv2d(in_channels=32,
                                out_channels=64,
-                               kernel_size=5)
+                               kernel_size=5,
+                               padding=(2,2))
+
+        self.conv2_2 = nn.Conv2d(in_channels=64,
+                                 out_channels=64,
+                                 kernel_size=5,
+                                 padding=(2,2))
+
         self.bn2 = nn.BatchNorm2d(64)
 
-        self.fc1 = nn.Linear(64 * 5 * 5, 512)
+        self.conv3 = nn.Conv2d(in_channels=64,
+                               out_channels=128,
+                               kernel_size=5,
+                               padding=(2,2))
+
+        self.conv3_3 = nn.Conv2d(in_channels=128,
+                                 out_channels=128,
+                                 kernel_size=5,
+                                 padding=(2,2))
+
+        self.bn3 = nn.BatchNorm2d(128)
+
+        self.fc1 = nn.Linear(128*8*8, 512)
 
         self.fc2 = nn.Linear(512, 64)
 
@@ -452,13 +615,27 @@ class LeNet(nn.Module):
 
     def forward(self, x):
         x = self.conv1(x)
+        x = F.relu(x)
+
+        x = self.conv1_1(x)
         # z = x.view(x.shape[0], -1)
         x = self.bn1(x)
         x = F.relu(x)
         x = F.max_pool2d(x, kernel_size=2)
 
         x = self.conv2(x)
+        x = F.relu(x)
+
+        x = self.conv2_2(x)
         x = self.bn2(x)
+        x = F.relu(x)
+
+        x = self.conv3(x)
+        x = F.relu(x)
+
+        x = self.conv3_3(x)
+        x = self.bn3(x)
+
         if self.layer == -5:
             z = (x.view(x.shape[0], -1)).clone()
 
@@ -490,21 +667,50 @@ class LeNet(nn.Module):
         x = F.softmax(x)
         return x, l_1, z
 
+
 class LeNet_fb(nn.Module):
-    def __init__(self, output_dim, input_dim=1):
+    def __init__(self, output_dim, input_dim=1, layer=-1):
         super(LeNet_fb, self).__init__()
+
+        self.layer = layer
 
         self.conv1 = nn.Conv2d(in_channels=input_dim,
                                out_channels=32,
-                               kernel_size=5)
+                               kernel_size=5,
+                               padding=(2,2))
+
+        self.conv1_1 = nn.Conv2d(in_channels=32,
+                                 out_channels=32,
+                                 kernel_size=5,
+                                 padding=(2,2))
+
         self.bn1 = nn.BatchNorm2d(32)
 
         self.conv2 = nn.Conv2d(in_channels=32,
                                out_channels=64,
-                               kernel_size=5)
+                               kernel_size=5,
+                               padding=(2,2))
+
+        self.conv2_2 = nn.Conv2d(in_channels=64,
+                                 out_channels=64,
+                                 kernel_size=5,
+                                 padding=(2,2))
+
         self.bn2 = nn.BatchNorm2d(64)
 
-        self.fc1 = nn.Linear(64 * 5 * 5, 512)
+        self.conv3 = nn.Conv2d(in_channels=64,
+                               out_channels=128,
+                               kernel_size=5,
+                               padding=(2,2))
+
+        self.conv3_3 = nn.Conv2d(in_channels=128,
+                                 out_channels=128,
+                                 kernel_size=5,
+                                 padding=(2,2))
+
+        self.bn3 = nn.BatchNorm2d(128)
+
+        self.fc1 = nn.Linear(128 * 8 * 8, 512)
 
         self.fc2 = nn.Linear(512, 64)
 
@@ -512,25 +718,38 @@ class LeNet_fb(nn.Module):
 
     def forward(self, x):
         x = self.conv1(x)
+        x = F.relu(x)
+        x = self.conv1_1(x)
+        # z = x.view(x.shape[0], -1)
         x = self.bn1(x)
         x = F.relu(x)
         x = F.max_pool2d(x, kernel_size=2)
 
         x = self.conv2(x)
+        x = F.relu(x)
+
+        x = self.conv2_2(x)
         x = self.bn2(x)
         x = F.relu(x)
+
+        x = self.conv3(x)
+        x = F.relu(x)
+
+        x = self.conv3_3(x)
+        x = self.bn3(x)
+        x = F.relu(x)
+
         x = F.max_pool2d(x, kernel_size=2)
 
         x = x.view(x.shape[0], -1)
 
+
         x = self.fc1(x)
         x = F.relu(x)
-
         x = self.fc2(x)
-
         x = F.relu(x)
-
         x = self.fc3(x)
 
         x = F.softmax(x)
         return x
+

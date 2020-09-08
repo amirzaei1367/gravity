@@ -1,8 +1,8 @@
-chose_dataset = 'mnist'
-chose_model ='lenet'
+# chose_dataset = 'mnist'
+# chose_model ='lenet'
 # chose_dataset = 'svhn'
-# chose_dataset = 'cifar10'
-# chose_model ='resnet'
+chose_dataset = 'cifar10'
+chose_model ='resnet'
 
 ##cifar10 layers [-1 ...-5]
 # model_layer = '-1_momentum'
@@ -10,8 +10,8 @@ model_layer = -2
 
 
 log_path = "/scratch/amirzaei/projects/gravity/log_dir/"
-dataset_path = '/projects/asasan/ali/DataSets/mnist/'
-# dataset_path = '/projects/asasan/ali/DataSets/cifar10/'
+# dataset_path = '/projects/asasan/ali/DataSets/mnist/'
+dataset_path = '/projects/asasan/ali/DataSets/cifar10/'
 # dataset_path = '/projects/asasan/ali/DataSets/svhn/'
 # dataset_path = '/projects/asasan/ali/DataSets/fmnist/'
 # dataset_path = '/projects/asasan/ali/DataSets/cifar10/'
@@ -21,23 +21,38 @@ mnist_batch = 64
 svhn_batch = 128
 fmnist_batch = 64
 # BATCH_SIZE = 1
+
+cifar_lr = 5e-3
+mnist_lr = 1e-4
+break_point_1 = 150
+break_point_2 = 250
+
+cifar_wd = 5e-4
+mnist_wd = 1e-4
+
 SEED = 1234
 OUTPUT_DIM = 10
-INPUT_DIM = 1
-EPOCHS = 250
+INPUT_DIM = 3
+EPOCHS = 500
 CENT_SWITCH = 10
-entropy_threshold_at = 0.85
+entropy_threshold_at = 0.70
 adv_trainer = None
 
 # DBSCN HYPER Parameteres:
-DBSCAN_EPS_i = 0.9
-DBSCAN_SAMPLES_i = 30
+DBSCAN_EPS_i =  None
+DBSCAN_SAMPLES_i = None
 Circle_Diam_i = 100
 
-DBSCAN_EPS_1 = 0.3
-DBSCAN_SAMPLES_1 = 20
-Circle_Diam_1 = 50
+DBSCAN_EPS_1 = None
+DBSCAN_SAMPLES_1 = None
+Circle_Diam_1 = 100
 
+# momentom Parameteres:
+EPSILON_i = 1.0
+MU_i = 0.0
+
+EPSILON_1 = 1.0
+MU_1 = 0.0
 
 model_urls = {
     'resnet18': 'https://download.pytorch.org/models/resnet18-5c106cde.pth',

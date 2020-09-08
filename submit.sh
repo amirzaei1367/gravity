@@ -1,9 +1,9 @@
 #!/bin/bash
 
-#SBATCH --job-name gr_m_2
+#SBATCH --job-name gr_c10_2
 #SBATCH --partition gpuq
 #SBATCH --nodes 1
-###SBATCH --nodelist=NODE076
+###SBATCH --reservation=amirzaei_81
 #SBATCH --ntasks-per-node 1
 #SBATCH --gres=gpu:1
 ###SBATCH --array=98-99
@@ -12,10 +12,11 @@
 #SBATCH --output=/scratch/amirzaei/projects/gravity/log_dir/%x.log
 ###SBATCH --output=/scratch/amirzaei/cifar100/extractor_%N_%j.log 
 ###SBATCH --output=/scratch/amirzaei/cluster_kd/kd_2clusters_%a/cluster1/extractor_%N_%j.log 
-#SBATCH --mem 50000
+#SBATCH --mem 500000
 ##SBATCH --qos=hhqos
 ###SBATCH --reservation=amirzaei_75
 ###SBATCH --time=0-12:0
+####SBATCH --nodelist=NODE081
 
 ##module load cuda80/toolkit/8.0.44
 ##module purge

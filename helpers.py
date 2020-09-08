@@ -19,6 +19,7 @@ import logging
 
 from sklearn.cluster import DBSCAN
 from sklearn.neighbors import NearestNeighbors
+from sklearn.metrics import confusion_matrix
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import minimum_spanning_tree
 from sklearn.preprocessing import StandardScaler
@@ -83,15 +84,42 @@ def min_max(train_iterator):
 
     return min_total, max_total
 
+def conv_matrix(model, iterator, device, chose_dataset, chose_model, model_layer,  alfa, index, black_box=False ):
+    model.eval()
+
+    gt = np.array([])
+    pred = np.array([])
+    with torch.no_grad():
+        for (x, y) in iterator:
+            np.append(gt, y.numpy())
+
+            x = x.to(device)
+            # y = y.to(device)
+
+            if black_box == True:
+                fx = model(x)
+            else:
+                fx, _, _ = model(x)
+
+            pd = fx.argmax(1, keepdim=True)
+            np.append(pred, pd.numpy())
+
+
+    conf_mtx = confusion_matrix(gt, pred)
+    with open(log_path + "{}/{}/{}/{}/{}.mtx".format(chose_dataset, chose_model, model_layer, alfa, index ),
+              "w") as p:
+        json.dump(conf_mtx, p)
 
 def evaluate(model, iterator, criterion, device, black_box=False):
+    gt = np.array([])
+    pred = np.array([])
     epoch_loss = 0
     epoch_acc = 0
 
     model.eval()
-
     with torch.no_grad():
         for (x, y) in iterator:
+            gt = np.append(gt, y.numpy())
             x = x.to(device)
             y = y.to(device)
 
@@ -103,11 +131,15 @@ def evaluate(model, iterator, criterion, device, black_box=False):
             loss = criterion(fx, y)
 
             acc = calculate_accuracy(fx, y)
+            pd = fx.argmax(1, keepdim=True)
+            pred = np.append(pred, pd.cpu().numpy())
 
             epoch_loss += loss.item()
             epoch_acc += acc.item()
+        # acc = np.sum( pred == gt)
+    return epoch_loss / len(iterator), epoch_acc / len(iterator), pred, gt
+    # return epoch_loss / len(iterator), acc, pred, gt
 
-    return epoch_loss / len(iterator), epoch_acc / len(iterator)
 
 def criterion_kd(fx, fz, y, fzz, l_1, l_11, alfa=0.1):
     # loss_ce = nn.CrossEntropyLoss()(fx, y)
@@ -142,7 +174,6 @@ def criterion_kd(fx, fz, y, fzz, l_1, l_11, alfa=0.1):
     #     loss2 = nn.KLDivLoss()(fz, fzz)
     return gravity_loss, loss_ce, loss_mse_1, loss_mse_i
     # return loss2
-
 
 def extract_centroid(model, loader , device, ls_name, ls_1_name, snapshot_name, centroid_name, centroid_1_name
                      , dbs_eps_1=0.3, dbs_smp_1=50, dbs_eps_i=0.9, dbs_smp_i=100):
@@ -186,34 +217,44 @@ def extract_centroid(model, loader , device, ls_name, ls_1_name, snapshot_name, 
     joblib.dump(l_1_original, log_path + "{}/{}/{}/{}".
                 format(chose_dataset, chose_model, model_layer, ls_1_name))
 
-    logger.info(f'start DBSCAN for {centroid_1_name}')
+    # logger.info(f'start DBSCAN for {centroid_1_name}')
+    # centroid_l_1_list = defaultdict(list)
+    # for key, item in l_1_original.items():
+    #     item_ = MinMaxScaler().fit_transform(item)
+    #     dbs_model = DBSCAN(eps=dbs_eps_1, min_samples=dbs_smp_1).fit(item_)
+    #     centroid_l_1_list[key] = np.mean(np.array(item)[dbs_model.labels_ == 0], axis=0)
+    #     if np.all(dbs_model.labels_ == -1):
+    #         print('All abnormal')
+    #         print(np.unique(dbs_model.labels_, return_counts=True))
+    # logger.info(f'finished DBSCAN for {centroid_1_name}')
+    # joblib.dump(centroid_l_1_list, log_path + "{}/{}/{}/{}".
+    #             format(chose_dataset, chose_model, model_layer, centroid_1_name))
+
     centroid_l_1_list = defaultdict(list)
     for key, item in l_1_original.items():
-        # kmeans = KMeans(init='k-means++', n_clusters=1, random_state=0).fit(item)
-        # centroid_list[key] = kmeans.cluster_centers_.tolist()[0]
-        item_ = MinMaxScaler().fit_transform(item)
-        dbs_model = DBSCAN(eps=dbs_eps_1, min_samples=dbs_smp_1).fit(item_)
-        centroid_l_1_list[key] = np.mean(np.array(item)[dbs_model.labels_ == 0], axis=0)
-        if np.all(dbs_model.labels_ == -1):
-            print('All abnormal')
-            print(np.unique(dbs_model.labels_, return_counts=True))
-    logger.info(f'finished DBSCAN for {centroid_1_name}')
+        centroid_l_1_list[key] = np.mean(np.array(item), axis=0)
+
     joblib.dump(centroid_l_1_list, log_path + "{}/{}/{}/{}".
                 format(chose_dataset, chose_model, model_layer, centroid_1_name))
 
-    logger.info(f'start DBSCAN for {centroid_name}')
+    # logger.info(f'start DBSCAN for {centroid_name}')
+    # centroid_list = defaultdict(list)
+    # for key, item in ls_original.items():
+    #     item_ = MinMaxScaler().fit_transform(item)
+    #     dbs_model = DBSCAN(eps=dbs_eps_i, min_samples=dbs_smp_i).fit(item_)
+    #     centroid_list[key] = np.mean(np.array(item)[dbs_model.labels_ == 0], axis=0)
+    #     if np.all(dbs_model.labels_ == -1):
+    #         print('All abnormal')
+    #         print(np.unique(dbs_model.labels_, return_counts=True))
+    #         # print(dbs_model.labels_)
+    # logger.info(f'finished DBSCAN for {centroid_name}')
+    # joblib.dump(centroid_list, log_path + "{}/{}/{}/{}".
+    #             format(chose_dataset, chose_model, model_layer, centroid_name))
+
+
     centroid_list = defaultdict(list)
     for key, item in ls_original.items():
-        # kmeans = KMeans(init='k-means++', n_clusters=1, random_state=0).fit(item)
-        # centroid_list[key] = kmeans.cluster_centers_.tolist()[0]
-        item_ = MinMaxScaler().fit_transform(item)
-        dbs_model = DBSCAN(eps=dbs_eps_i, min_samples=dbs_smp_i).fit(item_)
-        centroid_list[key] = np.mean(np.array(item)[dbs_model.labels_ == 0], axis=0)
-        if np.all(dbs_model.labels_ == -1):
-            print('All abnormal')
-            print(np.unique(dbs_model.labels_, return_counts=True))
-            # print(dbs_model.labels_)
-    logger.info(f'finished DBSCAN for {centroid_name}')
+        centroid_list[key] = np.mean(np.array(item), axis=0)
     joblib.dump(centroid_list, log_path + "{}/{}/{}/{}".
                 format(chose_dataset, chose_model, model_layer, centroid_name))
 
@@ -223,123 +264,134 @@ def extract_centroid(model, loader , device, ls_name, ls_1_name, snapshot_name, 
 
 #modify centroids based on my theory
 ####################################
-def modified_centroid(centroid_path, ls_path, track_fname, mdfy_cnt_fname, itr=1 , coef=1.5, round = 0, alfa = 0,
-                      epsilon=0.3, mu=1.0, dbs_eps = 0.3, dbs_smp=20, diam=50):
-    '''
-    :param centroid_path: indicates the name of original centroid file
-    :param ls_path: indicates the name of the latent spaces file
-    :param itr: shows the number of iteration needed for obtaining new centroid
-    :return: the new centroids
-    '''
-    global logger
-    logger.info(f'started modified_centroid {centroid_path} ')
-    # if not os.path.exists(log_path + "{}/{}/{}/{}".
-    #                             format(chose_dataset, chose_model, model_layer, track_fname)):
-    if round == 0:
-        centroid_list = joblib.load(log_path + "{}/{}/{}/{}".
-                                    format(chose_dataset, chose_model, model_layer, centroid_path))
-        df = pd.DataFrame(centroid_list)
-        a = list(df.columns)
-        #o -> origirnal, c -> centroid, a -> alfa, e ->
-        b = [f'c{i}_{round}' for i in a]
-        # b = [f'o_c{i}_a{alfa}_e{epoch}_g{coef}' for i in a]
-        ab = dict(zip(a, b))
-        df = df.rename(columns = ab)
-        df.to_csv(log_path + "{}/{}/{}/{}".
-                  format(chose_dataset, chose_model, model_layer, track_fname),
-                  index=False)
-
-        for c_key_i, c_item_i in centroid_list.items():
-            centroid_list[c_key_i] = list(centroid_list[c_key_i])
-
-        joblib.dump(centroid_list, log_path + "{}/{}/{}/{}".
-                    format(chose_dataset, chose_model, model_layer, mdfy_cnt_fname))
-    else:
-        df = pd.read_csv(log_path + "{}/{}/{}/{}".
-                         format(chose_dataset, chose_model, model_layer, track_fname))
-
-        centroid_list = joblib.load(log_path + "{}/{}/{}/{}".
-                                    format(chose_dataset, chose_model, model_layer, centroid_path))
-        ls_original = joblib.load(log_path + "{}/{}/{}/{}".
-                                    format(chose_dataset, chose_model, model_layer, ls_path))
-        for i in range(itr):
-            centroid_list_temp = defaultdict(list)
-            for c_key, c_item in centroid_list.items():
-                best_item = None
-                th_distance = 0
-                item_ = MinMaxScaler().fit_transform(ls_original[c_key])
-                dbs_model = DBSCAN(eps=dbs_eps, min_samples=dbs_smp).fit(item_)
-                for index, item in enumerate(ls_original[c_key]):
-                    # print('item', np.array(item))
-                    # print('centroid', list(centroid_list.values())[0])
-                    if dbs_model.labels_[index] != 0:
-                        continue
-                    np_mean = np.mean([np.linalg.norm(np.array(item) - np.array(b)) for b in list(centroid_list.values())])
-                    if np_mean > th_distance:
-                        th_distance = np_mean
-                        best_item = item.copy()
-                # centroid_list_temp[c_key] = best_item.copy()
-                # centroid_list[c_key] = best_item.copy()
-
-                if round == 1:
-                    # direction = best_item - centroid_list[c_key]
-                    # direction_norm = direction / np.linalg.norm(direction)
-                    # step_2_dir = epsilon * direction_norm
-                    # centroid_list[c_key] += step_2_dir.copy()
-                    direction = best_item - centroid_list[c_key]
-                    # direction_norm = direction
-                    # step_2_dir = epsilon * direction
-                    direction_norm = direction / np.linalg.norm(direction)
-                    step_2_dir = diam * direction_norm
-                    centroid_list[c_key] += step_2_dir.copy()
-                else:
-                    # g_i = (df[f'c{c_key}_{round-1}'] - df[f'c{c_key}_{round-2}']).values.squeeze()/epsilon
-                    # direction = best_item - centroid_list[c_key]
-                    # direction_norm = direction / np.linalg.norm(direction)
-                    # g_i_next = mu * g_i + direction_norm
-                    # step_2_dir = epsilon * g_i_next
-                    # centroid_list[c_key] += step_2_dir.copy()
-                    g_i = (df[f'c{c_key}_{round-1}'] - df[f'c{c_key}_{round-2}']).values.squeeze()
-                    direction = best_item - centroid_list[c_key]
-                    # direction_norm = direction / np.linalg.norm(direction)
-                    g_i_next_tmp = mu * g_i + epsilon * direction
-                    g_i_next = diam *  g_i_next_tmp / np.linalg.norm(g_i_next_tmp)
-                    # g_i_next = mu * g_i + epsilon * direction
-                    # step_2_dir = epsilon * g_i_next
-                    centroid_list[c_key] += g_i_next.copy()
-
-            # centroid_list = centroid_list_temp.copy()
-            # print(np_mean)
-            # exit()
-
-        df2 = pd.DataFrame(centroid_list)
-        a = list(df2.columns)
-        #m -> modified, c -> centroid, a -> alfa, e -> epoch
-        # b = [f'm_c{i}_a{alfa}_e{epoch}_g{coef} ' for i in a]
-        b = [f'c{i}_{round}' for i in a]
-        ab = dict(zip(a, b))
-        df2 = df2.rename(columns = ab)
-        df = pd.concat([df, df2], axis=1, sort=False)
-        df.to_csv(log_path + "{}/{}/{}/{}".
-                 format(chose_dataset, chose_model, model_layer, track_fname),
-                    index=False)
-
-        joblib.dump(centroid_list, log_path + "{}/{}/{}/{}".
-                    format(chose_dataset, chose_model, model_layer, mdfy_cnt_fname))
-    logger.info(f'finished modified_centroid {centroid_path}')
-    return centroid_list
-
-    # db_distance = list(centroid_list.values())
-    # lbl = list(centroid_list.keys())
-    # reduced_data = PCA(n_components=2).fit_transform(db_distance)
-
-    # fig, ax = plt.subplots()
-    # ax.scatter(reduced_data[:, 0], reduced_data[:, 1],
-    #            marker='o', s=10, linewidths=3,
-    #            color='r', zorder=10)
-    #
-    # for i, txt in enumerate(lbl):
-    #     ax.annotate(txt, (reduced_data[:, 0][i], reduced_data[:, 1][i]))
+# def modified_centroid(centroid_path, ls_path, track_fname, mdfy_cnt_fname, itr=1 , coef=1.5, round = 0, alfa = 0,
+#                       epsilon=0.3, mu=1.0, dbs_eps = 0.3, dbs_smp=20, diam=50):
+#     '''
+#     :param centroid_path: indicates the name of original centroid file
+#     :param ls_path: indicates the name of the latent spaces file
+#     :param itr: shows the number of iteration needed for obtaining new centroid
+#     :return: the new centroids
+#     '''
+#     global logger
+#     logger.info(f'started modified_centroid {centroid_path} ')
+#     # if not os.path.exists(log_path + "{}/{}/{}/{}".
+#     #                             format(chose_dataset, chose_model, model_layer, track_fname)):
+#     if round == 0:
+#         centroid_list = joblib.load(log_path + "{}/{}/{}/{}".
+#                                     format(chose_dataset, chose_model, model_layer, centroid_path))
+#         df = pd.DataFrame(centroid_list)
+#         a = list(df.columns)
+#         #o -> origirnal, c -> centroid, a -> alfa, e ->
+#         b = [f'c{i}_{round}' for i in a]
+#         # b = [f'o_c{i}_a{alfa}_e{epoch}_g{coef}' for i in a]
+#         ab = dict(zip(a, b))
+#         df = df.rename(columns = ab)
+#         df.to_csv(log_path + "{}/{}/{}/{}".
+#                   format(chose_dataset, chose_model, model_layer, track_fname),
+#                   index=False)
+#
+#         for c_key_i, c_item_i in centroid_list.items():
+#             centroid_list[c_key_i] = list(centroid_list[c_key_i])
+#
+#         joblib.dump(centroid_list, log_path + "{}/{}/{}/{}".
+#                     format(chose_dataset, chose_model, model_layer, mdfy_cnt_fname))
+#     else:
+#         df = pd.read_csv(log_path + "{}/{}/{}/{}".
+#                          format(chose_dataset, chose_model, model_layer, track_fname))
+#
+#         centroid_list = joblib.load(log_path + "{}/{}/{}/{}".
+#                                     format(chose_dataset, chose_model, model_layer, centroid_path))
+#         ls_original = joblib.load(log_path + "{}/{}/{}/{}".
+#                                     format(chose_dataset, chose_model, model_layer, ls_path))
+#
+#
+#         centroid_list_temp = defaultdict(list)
+#         for c_key, c_item in centroid_list.items():
+#             best_item = None
+#             th_distance = 0
+#             item_ = MinMaxScaler().fit_transform(ls_original[c_key])
+#             dbs_model = DBSCAN(eps=dbs_eps, min_samples=dbs_smp).fit(item_)
+#             for index, item in enumerate(ls_original[c_key]):
+#                 # print('item', np.array(item))
+#                 # print('centroid', list(centroid_list.values())[0])
+#                 if dbs_model.labels_[index] != 0:
+#                     continue
+#
+#                 dis_from_others = []
+#                 for a_key, b_item in centroid_list.items():
+#                     if a_key == c_key:
+#                         continue
+#                     dis_from_others.append(np.linalg.norm(np.array(item) - np.array(b_item)))
+#                 dis_from_others = np.array(dis_from_others)
+#                 dis_from_others = 1e3/dis_from_others # I used 1e3 just because 1/dis_... is a very small
+#                 sum_dis = np.sum(dis_from_others)
+#
+#                 # np_mean = np.mean([np.linalg.norm(np.array(item) - np.array(b)) for b in list(centroid_list.values())])
+#                 if sum_dis > th_distance:
+#                     th_distance = sum_dis
+#                     best_item = item.copy()
+#             # centroid_list_temp[c_key] = best_item.copy()
+#             # centroid_list[c_key] = best_item.copy()
+#
+#             if round == 1:
+#                 # direction = best_item - centroid_list[c_key]
+#                 # direction_norm = direction / np.linalg.norm(direction)
+#                 # step_2_dir = epsilon * direction_norm
+#                 # centroid_list[c_key] += step_2_dir.copy()
+#                 direction = best_item - centroid_list[c_key]
+#                 # direction_norm = direction
+#                 # step_2_dir = epsilon * direction
+#                 direction_norm = direction / np.linalg.norm(direction)
+#                 step_2_dir = diam * direction_norm
+#                 centroid_list[c_key] += step_2_dir.copy()
+#             else:
+#                 # g_i = (df[f'c{c_key}_{round-1}'] - df[f'c{c_key}_{round-2}']).values.squeeze()/epsilon
+#                 # direction = best_item - centroid_list[c_key]
+#                 # direction_norm = direction / np.linalg.norm(direction)
+#                 # g_i_next = mu * g_i + direction_norm
+#                 # step_2_dir = epsilon * g_i_next
+#                 # centroid_list[c_key] += step_2_dir.copy()
+#                 g_i = (df[f'c{c_key}_{round-1}'] - df[f'c{c_key}_{round-2}']).values.squeeze()
+#                 direction = best_item - centroid_list[c_key]
+#                 # direction_norm = direction / np.linalg.norm(direction)
+#                 g_i_next_tmp = mu * g_i + epsilon * direction
+#                 g_i_next = diam *  g_i_next_tmp / np.linalg.norm(g_i_next_tmp)
+#                 # g_i_next = mu * g_i + epsilon * direction
+#                 # step_2_dir = epsilon * g_i_next
+#                 centroid_list[c_key] += g_i_next.copy()
+#
+#         # centroid_list = centroid_list_temp.copy()
+#         # print(np_mean)
+#         # exit()
+#
+#         df2 = pd.DataFrame(centroid_list)
+#         a = list(df2.columns)
+#         #m -> modified, c -> centroid, a -> alfa, e -> epoch
+#         # b = [f'm_c{i}_a{alfa}_e{epoch}_g{coef} ' for i in a]
+#         b = [f'c{i}_{round}' for i in a]
+#         ab = dict(zip(a, b))
+#         df2 = df2.rename(columns = ab)
+#         df = pd.concat([df, df2], axis=1, sort=False)
+#         df.to_csv(log_path + "{}/{}/{}/{}".
+#                  format(chose_dataset, chose_model, model_layer, track_fname),
+#                     index=False)
+#
+#         joblib.dump(centroid_list, log_path + "{}/{}/{}/{}".
+#                     format(chose_dataset, chose_model, model_layer, mdfy_cnt_fname))
+#     logger.info(f'finished modified_centroid {centroid_path}')
+#     return centroid_list
+#
+#     # db_distance = list(centroid_list.values())
+#     # lbl = list(centroid_list.keys())
+#     # reduced_data = PCA(n_components=2).fit_transform(db_distance)
+#
+#     # fig, ax = plt.subplots()
+#     # ax.scatter(reduced_data[:, 0], reduced_data[:, 1],
+#     #            marker='o', s=10, linewidths=3,
+#     #            color='r', zorder=10)
+#     #
+#     # for i, txt in enumerate(lbl):
+#     #     ax.annotate(txt, (reduced_data[:, 0][i], reduced_data[:, 1][i]))
 
 # modify centroids based on normal vectors
 # def modified_centroid(centroid_path, ls_path, track_fname, mdfy_cnt_fname, itr=4 , coef=1.5, epoch = 0, alfa = 0):
@@ -448,6 +500,146 @@ def modified_centroid(centroid_path, ls_path, track_fname, mdfy_cnt_fname, itr=1
 #     # for i, txt in enumerate(lbl):
 #     #     ax.annotate(txt, (reduced_data[:, 0][i], reduced_data[:, 1][i]))
 
+# modify centroids based on normal vectors
+def modified_centroid(centroid_path, ls_path, track_fname, mdfy_cnt_fname, itr=1 , coef=1.5, round = 0, alfa = 0,
+                      epsilon=0.3, mu=1.0, dbs_eps = 0.3, dbs_smp=20, diam=50):
+    '''
+    :param centroid_path: indicates the name of original centroid file
+    :param ls_path: indicates the name of the latent spaces file
+    :param itr: shows the number of iteration needed for obtaining new centroid
+    :return: the new centroids
+    '''
+    global logger
+    logger.info(f'started modified_centroid {centroid_path} ')
+
+    if round == 0:
+        centroid_list = joblib.load(log_path + "{}/{}/{}/{}".
+                                    format(chose_dataset, chose_model, model_layer, centroid_path))
+        df = pd.DataFrame(centroid_list)
+        a = list(df.columns)
+        #o -> origirnal, c -> centroid, a -> alfa, e ->
+        b = [f'c{i}_{round}' for i in a]
+        # b = [f'o_c{i}_a{alfa}_e{epoch}_g{coef}' for i in a]
+        ab = dict(zip(a, b))
+        df = df.rename(columns = ab)
+        df.to_csv(log_path + "{}/{}/{}/{}".
+                  format(chose_dataset, chose_model, model_layer, track_fname),
+                  index=False)
+
+        for c_key_i, c_item_i in centroid_list.items():
+            centroid_list[c_key_i] = list(centroid_list[c_key_i])
+
+        joblib.dump(centroid_list, log_path + "{}/{}/{}/{}".
+                    format(chose_dataset, chose_model, model_layer, mdfy_cnt_fname))
+    else:
+        df = pd.read_csv(log_path + "{}/{}/{}/{}".
+                         format(chose_dataset, chose_model, model_layer, track_fname))
+
+        centroid_list = joblib.load(log_path + "{}/{}/{}/{}".
+                                    format(chose_dataset, chose_model, model_layer, centroid_path))
+        ls_original = joblib.load(log_path + "{}/{}/{}/{}".
+                                    format(chose_dataset, chose_model, model_layer, ls_path))
+
+        std_list = defaultdict(list)
+        for ls_key, ls_item in ls_original.items():
+            std_list[ls_key] = np.std(list(ls_item))
+
+        d_i_j = defaultdict(dict)
+        for c_key_i, c_item_i in centroid_list.items():
+            for c_key_j, c_item_j in centroid_list.items():
+                src = np.array(c_item_i)
+                dst = np.array(c_item_j)
+                d_i_j[c_key_i][c_key_j]= LA.norm(src - dst)
+
+        # print('std_list', std_list)
+        # print('d_i_j', d_i_j)
+        # exit()
+
+        bisectors = {}
+        for c_key_i, c_item_i in centroid_list.items():
+            temp_bisectors = []
+            temp_gravities = []
+            bisector = 0
+            for c_key_j, c_item_j in centroid_list.items():
+                if c_key_i == c_key_j:
+                    continue
+                sigma1 = std_list[c_key_i]
+                sigma2 = std_list[c_key_j]
+                d = (d_i_j[c_key_i][c_key_j])**2
+                # src = np.array(c_item_i)/LA.norm(c_item_i)
+                # dst = np.array(c_item_j)/LA.norm(c_item_j)
+                src = np.array(c_item_i)
+                dst = np.array(c_item_j)
+                temp_bisector = src - dst
+                temp_bisectors.append(temp_bisector)
+                temp_gravity = (sigma1*sigma2)/d
+                temp_gravities.append(temp_gravity)
+
+
+            normalize_bisecotrs = [x/np.linalg.norm(x) for x in temp_bisectors]
+            bisector = np.dot(temp_gravities, np.array(normalize_bisecotrs))
+            # bisector = np.dot(temp_gravities, np.array(temp_bisectors))
+
+            bisectors[c_key_i] = bisector.copy()
+
+        ## this section for normalizing each vector based on the force magnitiude
+        b = np.array(list(bisectors.values()))
+        c = np.linalg.norm(b, axis=1)
+        d = np.max(c)
+
+        for c_key_i, c_item_i in centroid_list.items():
+            if round == 1:
+                centroid_list[c_key_i] += (diam * epsilon *  bisectors[c_key_i] / d).copy()
+            else:
+                g_i = (df[f'c{c_key_i}_{round-1}'] - df[f'c{c_key_i}_{round-2}']).values.squeeze()
+                g_i_next = mu * g_i + epsilon * diam * bisectors[c_key_i] / d
+                # g_i_next = diam *  g_i_next_tmp / np.linalg.norm(g_i_next_tmp)
+                centroid_list[c_key_i] += g_i_next.copy()
+
+
+        # for c_key_i, c_item_i in centroid_list.items():
+        #     if round == 1:
+        #         direction = bisectors[c_key_i]
+        #         direction_norm = direction / np.linalg.norm(direction)
+        #         step_2_dir = diam * epsilon *  direction_norm
+        #         centroid_list[c_key_i] += step_2_dir.copy()
+        #     else:
+        #         g_i = (df[f'c{c_key_i}_{round-1}'] - df[f'c{c_key_i}_{round-2}']).values.squeeze()
+        #         g_i_next_tmp = mu * g_i + epsilon * bisectors[c_key_i]
+        #         g_i_next = diam *  g_i_next_tmp / np.linalg.norm(g_i_next_tmp)
+        #         centroid_list[c_key_i] += g_i_next.copy()
+
+        # for c_key_i, c_item_i in centroid_list.items():
+        #     centroid_list[c_key_i] = list(np.array(centroid_list[c_key_i]) + bisectors[c_key_i])
+
+        df2 = pd.DataFrame(centroid_list)
+        a = list(df2.columns)
+        b = [f'c{i}_{round}' for i in a]
+        ab = dict(zip(a, b))
+        df2 = df2.rename(columns = ab)
+        df = pd.concat([df, df2], axis=1, sort=False)
+        df.to_csv(log_path + "{}/{}/{}/{}".
+                 format(chose_dataset, chose_model, model_layer, track_fname),
+                    index=False)
+
+        joblib.dump(centroid_list, log_path + "{}/{}/{}/{}".
+                    format(chose_dataset, chose_model, model_layer, mdfy_cnt_fname))
+    logger.info(f'finished modified_centroid {centroid_path}')
+    return centroid_list
+
+    # db_distance = list(centroid_list.values())
+    # lbl = list(centroid_list.keys())
+    # reduced_data = PCA(n_components=2).fit_transform(db_distance)
+
+    # fig, ax = plt.subplots()
+    # ax.scatter(reduced_data[:, 0], reduced_data[:, 1],
+    #            marker='o', s=10, linewidths=3,
+    #            color='r', zorder=10)
+    #
+    # for i, txt in enumerate(lbl):
+    #     ax.annotate(txt, (reduced_data[:, 0][i], reduced_data[:, 1][i]))
+
+
 def distance_metric(latent_spaces):
     ## calculating the distance based on the SVM marginal distance of latent spaces
     svm_db = pd.DataFrame()
@@ -504,9 +696,14 @@ def vis(ls_name, component=2, technique='tsne', path=None, maped=None):
     # ls_original = joblib.load(ls_path)
     lbl = []
     color = []
+    classes = [x for x in range(10)]
+    colors = ['pink', 'blue', 'yellow',
+              'red', 'green', 'orange',
+              'purple', 'brown', 'cyan', 'olive']
     for index, (key, item) in enumerate(ls_original.items()):
-        new_lbl = [key + 100] * len(item)
+        # new_lbl = [key + 100] * len(item)
         #         new_color = [key + 10]*len(item)
+        new_lbl = [key] * len(item)
         lbl += new_lbl.copy()
         if index == 0:
             out_arr = np.array(item)
@@ -532,13 +729,69 @@ def vis(ls_name, component=2, technique='tsne', path=None, maped=None):
 
         tsne_data = np.vstack((tsne_data.T, np.array(lbl))).T
         tsne_df = pd.DataFrame(data=tsne_data, columns=['dim_1', 'dim_2', 'lbl'])
-        if np.all(maped == None):
-            sns.FacetGrid(tsne_df, hue='lbl', size=6).map(plt.scatter, 'dim_1', 'dim_2', 'lbl').add_legend()
-        else:
-            tsne_df.plot.scatter(x='dim_1', y='dim_2', c=maped)
-        plt.savefig(log_path + "{}/{}/{}/{}.png".
-                    format(chose_dataset, chose_model, model_layer, ls_name))
+
+        fig, ax = plt.subplots()
+        for lbl_ , color_ in zip(classes, colors):
+            ax.scatter(tsne_df[tsne_df['lbl']==lbl_]['dim_1'].values,
+                       tsne_df[tsne_df['lbl']==lbl_]['dim_2'].values,
+                       c=color_,
+                       label=lbl_,
+                       alpha=0.5)
+
+
+        ax.legend(bbox_to_anchor=(1., 1.03), loc="upper left")
+
+        fig.savefig(log_path + "{}/{}/{}/{}.png".
+                    format(chose_dataset, chose_model, model_layer, ls_name), bbox_inches='tight', dpi=300)
         # plt.show()
+
+# def vis(ls_name, component=2, technique='tsne', path=None, maped=None):
+#     if path == None:
+#         ls_original = ls_path
+#     else:
+#         ls_original = joblib.load(log_path + "{}/{}/{}/{}".
+#                                   format(chose_dataset, chose_model, model_layer, ls_name))
+#
+#     # ls_original = joblib.load(ls_path)
+#     lbl = []
+#     color = []
+#     colors_ = np.linspace(0xf00000, 0xF0f000, 10, dtype=int)
+#     colors = np.array(['#' + str(hex(clr))[2:] for clr in colors_])
+#     for index, (key, item) in enumerate(ls_original.items()):
+#         new_lbl = [key + 100] * len(item)
+#         #         new_color = [key + 10]*len(item)
+#         lbl += new_lbl.copy()
+#         if index == 0:
+#             out_arr = np.array(item)
+#         else:
+#             new_item = np.array(item)
+#             out_arr = np.vstack((out_arr, new_item))
+#
+#     if technique == 'tsne':
+#         tsne_model = TSNE(n_components=component, random_state=SEED)
+#         tsne_data_ = tsne_model.fit_transform(out_arr)
+#         tsne_data = tsne_data_.copy()
+#
+#         tsne_data = np.vstack((tsne_data.T, np.array(lbl), np.array(color))).T
+#         tsne_df = pd.DataFrame(data=tsne_data, columns=['dim_1', 'dim_2', 'lbl', 'color'])
+#         sns.FacetGrid(tsne_df, hue='color', size=6).map(plt.scatter, 'dim_1', 'dim_2', 'color').add_legend()
+#         plt.savefig(log_path + "{}/{}/{}/{}.png".
+#                                 format(chose_dataset, chose_model, model_layer, ls_name))
+#
+#     if technique == 'pca':
+#         pca = decomposition.PCA(n_components=2, random_state=3)
+#         pca.fit(out_arr)
+#         tsne_data = pca.transform(out_arr)
+#
+#         tsne_data = np.vstack((tsne_data.T, np.array(lbl))).T
+#         tsne_df = pd.DataFrame(data=tsne_data, columns=['dim_1', 'dim_2', 'lbl'])
+#         if np.all(maped == None):
+#             sns.FacetGrid(tsne_df, hue='lbl', size=6).map(plt.scatter, 'dim_1', 'dim_2', 'lbl').add_legend()
+#         else:
+#             tsne_df.plot.scatter(x='dim_1', y='dim_2', c=maped)
+#         plt.savefig(log_path + "{}/{}/{}/{}.png".
+#                     format(chose_dataset, chose_model, model_layer, ls_name))
+#         # plt.show()
 
 # # Mean and Standard Deiation of the Dataset
 # mean = [0.4914, 0.4822, 0.4465]
